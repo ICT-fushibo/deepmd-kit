@@ -284,6 +284,18 @@ class TestSeZMModelCompile(unittest.TestCase):
             "use_compile": use_compile,
         }
 
+    def test_legacy_energy_fitting_wire_type(self) -> None:
+        """Released pre-registry DPA4 checkpoints keep loading unchanged."""
+        params = self._build_model_params(use_compile=False)
+        params["fitting_net"]["type"] = "ener"
+        model = get_sezm_model(params)
+        self.assertIsInstance(model, SeZMModel)
+        self.assertEqual(
+            type(model.atomic_model.fitting_net).__name__,
+            "SeZMEnergyFittingNet",
+        )
+        self.assertIn('"type": "ener"', model.model_def_script)
+
     def _make_tiny_frame(
         self,
         nframe: int = 1,

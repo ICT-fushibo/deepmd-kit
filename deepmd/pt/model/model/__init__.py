@@ -414,7 +414,17 @@ def get_sezm_model(model_params: dict) -> BaseModel:
     descriptor = BaseDescriptor(**model_params["descriptor"])
 
     fitting_net = copy.deepcopy(model_params["fitting_net"])
-    fitting_net.setdefault("type", "dpa4_ener")
+    # DPA4 checkpoints produced before the dedicated fitting registries were
+    # introduced used the generic wire value ``ener``.  At that time this
+    # function discarded the value and always constructed
+    # ``SeZMEnergyFittingNet`` (see the implementation before #5587).  Keep
+    # those released checkpoints loadable without rewriting their state dict:
+    # this changes only the construction-time registry key, never a parameter
+    # tensor or the serialized model definition retained below.
+    if fitting_net.get("type") == "ener":
+        fitting_net["type"] = "dpa4_ener"
+    else:
+        fitting_net.setdefault("type", "dpa4_ener")
     fitting_net["ntypes"] = descriptor.get_ntypes()
     fitting_net["type_map"] = copy.deepcopy(model_params["type_map"])
     fitting_net["mixed_types"] = descriptor.mixed_types()
