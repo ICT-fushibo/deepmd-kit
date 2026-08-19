@@ -151,6 +151,20 @@ class NvNeighborList(NeighborList):
     inputs keep only local atoms.
     """
 
+    def __init__(self, *, compile_truncation: bool = True) -> None:
+        """Create the CUDA neighbor-list builder.
+
+        Parameters
+        ----------
+        compile_truncation
+            Use the historical Inductor-compiled distance-sort/truncation
+            helper.  The default preserves the existing inference behaviour.
+            GPU-resident Opt1 MD explicitly sets this to ``False`` because
+            compilation belongs to a later optimization stage; the eager
+            helper performs the same operation entirely on CUDA tensors.
+        """
+        self.compile_truncation = bool(compile_truncation)
+
     def build(
         self,
         coord: Any,
@@ -226,9 +240,12 @@ class NvNeighborList(NeighborList):
                 num_neighbors=num_neighbors,
                 shifts=shifts,
             )
-            nlist = _truncate_to_sel_compiled(
-                extended_coord, nlist, target_neighbors, float(rcut)
+            truncate = (
+                _truncate_to_sel_compiled
+                if self.compile_truncation
+                else _truncate_to_sel
             )
+            nlist = truncate(extended_coord, nlist, target_neighbors, float(rcut))
             if pair_excl is not None:
                 from deepmd.dpmodel.utils.nlist import (
                     apply_pair_exclusion_nlist,
@@ -290,9 +307,21 @@ def _truncate_to_sel(
 # Inductor graph. ``dynamic=True`` keeps the per-system ``(nf, nloc, nnei)`` shapes
 # on one compiled graph instead of recompiling per system size, and fusing the
 # pipeline avoids materializing the full ``(nf, nloc, nnei, 3)`` distance
-# temporaries, which lowers both this step's peak memory and its latency relative
-# to eager. Compilation is lazy: it happens on first call, not at import.
-_truncate_to_sel_compiled = torch.compile(_truncate_to_sel, dynamic=True)
+# temporaries.  Even construction of the OptimizedFunction is lazy so callers
+# selecting ``compile_truncation=False`` never invoke ``torch.compile``.
+_truncate_to_sel_inductor: Any | None = None
+
+
+def _truncate_to_sel_compiled(
+    extended_coord: torch.Tensor,
+    nlist: torch.Tensor,
+    nsel: int,
+    rcut: float,
+) -> torch.Tensor:
+    global _truncate_to_sel_inductor
+    if _truncate_to_sel_inductor is None:
+        _truncate_to_sel_inductor = torch.compile(_truncate_to_sel, dynamic=True)
+    return _truncate_to_sel_inductor(extended_coord, nlist, nsel, rcut)
 
 
 def _matrix_to_extended_inputs(
