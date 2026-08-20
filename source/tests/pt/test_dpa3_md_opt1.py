@@ -195,3 +195,6 @@ def test_opt1_neighbor_builder_can_disable_compile() -> None:
 
     assert NvNeighborList().compile_truncation is True
     assert NvNeighborList(compile_truncation=False).compile_truncation is False
+    evaluator_init = inspect.getsource(opt1.DPA3EnergyForceEvaluator.__init__)
+    assert "prepare_fixed_shape" in evaluator_init
+    assert "neighbor_capacity_factor" in evaluator_init

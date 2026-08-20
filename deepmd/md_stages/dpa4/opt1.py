@@ -78,6 +78,11 @@ def _require_raw_pt(model_path: str | Path) -> Path:
 class DPA4EnergyForceEvaluator:
     """Direct CUDA-tensor evaluator for an eager DPA4/SeZM checkpoint."""
 
+    # SeZM always computes the reduced cell derivative used for the total
+    # virial.  Requesting the per-atom derivative additionally materializes an
+    # O(n_atoms) tensor which the MD route never consumes.
+    do_atomic_virial = False
+
     def __init__(
         self,
         atoms: Any,
@@ -252,7 +257,7 @@ class DPA4EnergyForceEvaluator:
                 box=self.cell,
                 fparam=self.fparam,
                 aparam=self.aparam,
-                do_atomic_virial=True,
+                do_atomic_virial=self.do_atomic_virial,
                 charge_spin=self.charge_spin,
             )
         try:
@@ -267,6 +272,18 @@ class DPA4EnergyForceEvaluator:
         return force, energy, virial
 
 
+def _evaluator_metadata(evaluator: DPA4EnergyForceEvaluator) -> dict[str, Any]:
+    """Report checkpoint/interface policy without hard-coded precision labels."""
+    model_precision = str(evaluator.model_dtype).removeprefix("torch.")
+    return {
+        "model_precision": model_precision,
+        "model_interface_precision": model_precision,
+        "checkpoint_descriptor_precision": evaluator.descriptor_precision,
+        "checkpoint_fitting_precision": evaluator.fitting_precision,
+        "do_atomic_virial": evaluator.do_atomic_virial,
+    }
+
+
 def run_md(request: MDRunRequest) -> MDRunResult:
     """Run DPA4 Opt1; unsupported modes fail instead of falling back."""
     if request.model != "dpa4" or request.stage != "opt1":
@@ -276,8 +293,6 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             "DPA4 Opt1 requires backend='gpu-resident'; "
             f"got {request.backend!r}"
         )
-    if request.config.dtype != "float64":
-        raise ValueError("DPA4 Opt1 requires --dtype float64 for the MD state")
     if request.config.dtype != "float64":
         raise ValueError(
             "DPA4 Opt1 fixes the physical MD state to float64; "
@@ -338,12 +353,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "neighborlist_backend": evaluator.neighbor_backend,
         "neighbor_rebuilt_each_force_evaluation": True,
         "md_state_precision": "float64",
-        "model_precision": str(evaluator.model_dtype).removeprefix("torch."),
-        "model_interface_precision": str(evaluator.model_dtype).removeprefix(
-            "torch."
-        ),
-        "checkpoint_descriptor_precision": evaluator.descriptor_precision,
-        "checkpoint_fitting_precision": evaluator.fitting_precision,
+        **_evaluator_metadata(evaluator),
         "stress_convention": "ase-tensile=-sym(deepmd-virial)/volume",
         "legacy_fitting_type_compatibility": (
             "ener-normalized-in-memory-to-dpa4_ener"

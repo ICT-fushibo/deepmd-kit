@@ -73,6 +73,9 @@ class DPA3EnergyForceEvaluator:
         model_path: str | Path,
         *,
         device: str | torch.device,
+        neighbor_capacity_factor: float = 1.25,
+        neighbor_capacity_headroom: int = 16,
+        neighbor_search_capacity: int | None = None,
     ) -> None:
         self.device = torch.device(device)
         if self.device.type != "cuda" or not torch.cuda.is_available():
@@ -120,6 +123,10 @@ class DPA3EnergyForceEvaluator:
             )
         if backend.get_has_spin() or backend.get_has_hessian():
             raise NotImplementedError("DPA3 Opt1 does not support spin/Hessian models")
+        if not bool(descriptor.get("use_loc_mapping", True)):
+            raise NotImplementedError(
+                "DPA3 Opt1 fixed-slot ghosts require descriptor.use_loc_mapping=True"
+            )
 
         model_dtype = getattr(
             backend.dp.model["Default"],
@@ -136,7 +143,7 @@ class DPA3EnergyForceEvaluator:
                 torch.float64,
             )
         self.model_dtype = model_dtype
-        self.neighbor_backend = "nvalchemiops-eager"
+        self.neighbor_backend = "nvalchemiops-eager-fixed-shape"
 
         type_index = dict(
             zip(
@@ -160,6 +167,19 @@ class DPA3EnergyForceEvaluator:
             ).reshape(1, 3, 3)
             if bool(np.asarray(atoms.pbc).any())
             else None
+        )
+        initial_positions = torch.as_tensor(
+            atoms.get_positions(), dtype=self.model_dtype, device=self.device
+        ).reshape(1, -1, 3)
+        inner = backend.dp.model["Default"]
+        self.neighbor_shape_metadata = backend._nlist_builder.prepare_fixed_shape(
+            initial_positions,
+            self.cell,
+            float(backend.get_rcut()),
+            list(inner.get_sel()),
+            capacity_factor=float(neighbor_capacity_factor),
+            capacity_headroom=int(neighbor_capacity_headroom),
+            search_capacity=neighbor_search_capacity,
         )
         self.fparam = self._optional_input(
             atoms.info.get("fparam"),
@@ -615,8 +635,20 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     )
     state = GPUMDState(positions=positions, momenta=momenta)
     initial_state = state.initial_clone()
+    configured_capacity = request.options.get("neighbor_search_capacity")
     evaluator = DPA3EnergyForceEvaluator(
-        atoms, request.model_path, device=device
+        atoms,
+        request.model_path,
+        device=device,
+        neighbor_capacity_factor=float(
+            request.options.get("neighbor_capacity_factor", 1.25)
+        ),
+        neighbor_capacity_headroom=int(
+            request.options.get("neighbor_capacity_headroom", 16)
+        ),
+        neighbor_search_capacity=(
+            None if configured_capacity is None else int(configured_capacity)
+        ),
     )
 
     if request.config.warmup_steps:
@@ -638,6 +670,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "model_path": str(Path(request.model_path).resolve()),
         "integrator": request.config.integrator,
         "neighborlist_backend": evaluator.neighbor_backend,
+        "neighborlist_fixed_shape": dict(evaluator.neighbor_shape_metadata),
         "neighbor_rebuilt_each_force_evaluation": True,
         "md_state_precision": "float64",
         "model_precision": str(evaluator.model_dtype).removeprefix("torch."),

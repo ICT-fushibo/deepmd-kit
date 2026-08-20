@@ -8,6 +8,7 @@ non-periodic path.  Built neighbor lists are compared against the native dense
 builder at the nlist level (edge topology + geometry).
 """
 
+import inspect
 import unittest
 from unittest.mock import (
     patch,
@@ -25,9 +26,14 @@ from deepmd.pt.utils.nlist import (
 from deepmd.pt.utils.nv_nlist import (
     NvNeighborList,
     _input_device_context,
+    _matrix_to_extended_inputs,
+    _matrix_to_extended_inputs_fixed_slots,
 )
 from deepmd.pt_expt.utils.edge_schema import (
     edge_schema_from_extended,
+)
+from deepmd.pt_expt.utils.nv_graph_builder import (
+    nv_search_matrix_fixed,
 )
 from deepmd.pt_expt.utils.vesin_neighbor_list import (
     VesinNeighborList,
@@ -38,6 +44,175 @@ _NV_AVAILABLE = nv_nlist.is_nv_available()
 _TEST_DEVICES = [torch.device("cpu")]
 if torch.cuda.is_available() and torch.cuda.device_count() > 0:
     _TEST_DEVICES.append(torch.device("cuda:0"))
+
+
+class TestFixedSlotConversion(unittest.TestCase):
+    """CPU-runnable checks for the Opt1 fixed-shape conversion."""
+
+    def test_fixed_slots_match_compact_topology_and_geometry(self) -> None:
+        coord = torch.tensor(
+            [
+                [
+                    [0.2, 0.3, 0.4],
+                    [1.1, 0.5, 0.7],
+                    [2.2, 1.4, 0.9],
+                ]
+            ],
+            dtype=torch.float64,
+        )
+        atype = torch.tensor([[0, 1, 0]], dtype=torch.int64)
+        cell = torch.eye(3, dtype=torch.float64).reshape(1, 3, 3) * 4.0
+        neighbor_matrix = torch.tensor(
+            [[1, 2, 2, 0], [0, 2, 0, 0], [0, 1, 0, 0]], dtype=torch.int64
+        )
+        num_neighbors = torch.tensor([3, 2, 2], dtype=torch.int64)
+        shifts = torch.zeros((3, 4, 3), dtype=torch.int64)
+        shifts[0, 1, 0] = -1
+        shifts[0, 2, 1] = 1
+        shifts[1, 1, 0] = 1
+        shifts[2, 0, 1] = -1
+
+        compact_coord, _, compact_mapping, compact_nlist = (
+            _matrix_to_extended_inputs(
+                coord=coord,
+                atype=atype,
+                cell=cell,
+                nloc=3,
+                neighbor_matrix=neighbor_matrix,
+                num_neighbors=num_neighbors,
+                shifts=shifts,
+            )
+        )
+        shift_grid = torch.tensor(
+            [
+                (ix, iy, iz)
+                for ix in range(-1, 2)
+                for iy in range(-1, 2)
+                for iz in range(-1, 2)
+                if (ix, iy, iz) != (0, 0, 0)
+            ],
+            dtype=coord.dtype,
+        )
+        fixed_coord, _, fixed_mapping, fixed_nlist = (
+            _matrix_to_extended_inputs_fixed_slots(
+                coord=coord,
+                atype=atype,
+                cell=cell,
+                nloc=3,
+                neighbor_matrix=neighbor_matrix,
+                num_neighbors=num_neighbors,
+                shifts=shifts,
+                shift_bounds=(1, 1, 1),
+                shift_cart=torch.einsum("sd,fdk->fsk", shift_grid, cell),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                _edge_topology_from_extended(compact_mapping, compact_nlist),
+                _edge_topology_from_extended(fixed_mapping, fixed_nlist),
+            )
+        )
+        torch.testing.assert_close(
+            _edge_geometry_from_extended(
+                compact_coord, compact_mapping, compact_nlist
+            ),
+            _edge_geometry_from_extended(fixed_coord, fixed_mapping, fixed_nlist),
+        )
+
+    def test_fixed_hot_helpers_have_no_host_shape_extraction(self) -> None:
+        for function in (
+            nv_search_matrix_fixed,
+            _matrix_to_extended_inputs_fixed_slots,
+        ):
+            source = inspect.getsource(function)
+            self.assertNotIn(".item(", source)
+            self.assertNotIn(".cpu(", source)
+            self.assertNotIn("torch.nonzero", source)
+            self.assertNotIn("torch.unique", source)
+        fixed_search_source = inspect.getsource(nv_search_matrix_fixed)
+        self.assertIn("torch._assert_async", fixed_search_source)
+        self.assertIn("num_neighbors <= capacity", fixed_search_source)
+
+    def test_fixed_slots_preserve_energy_force_and_cell_gradient(self) -> None:
+        """Duplicate-free and fixed ghost layouts give identical derivatives."""
+        atype = torch.tensor([[0, 1, 0]], dtype=torch.int64)
+        neighbor_matrix = torch.tensor(
+            [[1, 2, 2, 0], [0, 2, 0, 0], [0, 1, 0, 0]], dtype=torch.int64
+        )
+        num_neighbors = torch.tensor([3, 2, 2], dtype=torch.int64)
+        shifts = torch.zeros((3, 4, 3), dtype=torch.int64)
+        shifts[0, 1, 0] = -1
+        shifts[0, 2, 1] = 1
+        shifts[1, 1, 0] = 1
+        shifts[2, 0, 1] = -1
+
+        def evaluate(*, fixed: bool):
+            coord = torch.tensor(
+                [[[0.2, 0.3, 0.4], [1.1, 0.5, 0.7], [2.2, 1.4, 0.9]]],
+                dtype=torch.float64,
+                requires_grad=True,
+            )
+            cell = (torch.eye(3, dtype=torch.float64) * 4.0).reshape(1, 3, 3)
+            cell.requires_grad_(True)
+            if fixed:
+                shift_grid = torch.tensor(
+                    [
+                        (ix, iy, iz)
+                        for ix in range(-1, 2)
+                        for iy in range(-1, 2)
+                        for iz in range(-1, 2)
+                        if (ix, iy, iz) != (0, 0, 0)
+                    ],
+                    dtype=coord.dtype,
+                )
+                result = _matrix_to_extended_inputs_fixed_slots(
+                    coord=coord,
+                    atype=atype,
+                    cell=cell,
+                    nloc=3,
+                    neighbor_matrix=neighbor_matrix,
+                    num_neighbors=num_neighbors,
+                    shifts=shifts,
+                    shift_bounds=(1, 1, 1),
+                    shift_cart=torch.einsum("sd,fdk->fsk", shift_grid, cell),
+                )
+            else:
+                result = _matrix_to_extended_inputs(
+                    coord=coord,
+                    atype=atype,
+                    cell=cell,
+                    nloc=3,
+                    neighbor_matrix=neighbor_matrix,
+                    num_neighbors=num_neighbors,
+                    shifts=shifts,
+                )
+            extended_coord, _, _, nlist = result
+            valid = nlist >= 0
+            safe_nlist = nlist.clamp_min(0)
+            neighbor_coord = torch.gather(
+                extended_coord,
+                1,
+                safe_nlist.reshape(1, -1, 1).expand(-1, -1, 3),
+            ).reshape(1, 3, 4, 3)
+            edge_vec = neighbor_coord - coord[:, :, None, :]
+            energy = (edge_vec.square() * valid.unsqueeze(-1)).sum()
+            coord_grad, cell_grad = torch.autograd.grad(energy, (coord, cell))
+            return energy.detach(), coord_grad, cell_grad
+
+        compact = evaluate(fixed=False)
+        fixed = evaluate(fixed=True)
+        for fixed_value, compact_value in zip(fixed, compact, strict=True):
+            torch.testing.assert_close(fixed_value, compact_value)
+
+    def test_builder_defaults_to_dynamic_compact_mode(self) -> None:
+        builder = NvNeighborList()
+        self.assertIsNone(builder.fixed_search_capacity)
+        self.assertEqual(
+            builder.fixed_shape_metadata()["ghost_layout"], "dynamic-compact"
+        )
+        self.assertEqual(
+            builder.fixed_shape_metadata()["overflow_policy"], "device-assert"
+        )
 
 
 def _edge_topology_from_extended(

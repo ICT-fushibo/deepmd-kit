@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -86,6 +88,68 @@ def test_hot_force_path_has_no_host_or_numpy_conversion() -> None:
     assert ".cpu(" not in source
     assert ".numpy(" not in source
     assert ".item(" not in source
+
+
+def test_force_path_skips_atomic_virial_but_keeps_total_virial(monkeypatch) -> None:
+    class FakeModel:
+        kwargs = None
+
+        def __call__(self, positions, atom_types, **kwargs):
+            self.kwargs = kwargs
+            assert positions.shape == (1, 2, 3)
+            assert atom_types.shape == (1, 2)
+            return {
+                "force": torch.ones((1, 2, 3), dtype=torch.float64),
+                "energy": torch.tensor([[-3.25]], dtype=torch.float64),
+                "virial": torch.arange(9, dtype=torch.float64).reshape(1, 9),
+            }
+
+    evaluator = object.__new__(opt1.DPA4EnergyForceEvaluator)
+    evaluator.device = torch.device("cpu")
+    evaluator.model_dtype = torch.float64
+    evaluator.atom_types = torch.zeros((1, 2), dtype=torch.long)
+    evaluator.cell = torch.eye(3, dtype=torch.float64).reshape(1, 3, 3)
+    evaluator.fparam = None
+    evaluator.aparam = None
+    evaluator.charge_spin = None
+    evaluator._model = FakeModel()
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
+
+    force, energy, virial = evaluator(
+        torch.zeros((2, 3), dtype=torch.float64)
+    )
+
+    assert evaluator._model.kwargs["do_atomic_virial"] is False
+    assert force.shape == (2, 3)
+    assert energy.item() == pytest.approx(-3.25)
+    torch.testing.assert_close(
+        virial, torch.arange(9, dtype=torch.float64).reshape(3, 3)
+    )
+
+
+@pytest.mark.parametrize(
+    ("model_dtype", "expected"),
+    [(torch.float32, "float32"), (torch.float64, "float64")],
+)
+def test_metadata_reports_actual_interface_and_checkpoint_precision(
+    model_dtype, expected
+) -> None:
+    evaluator = SimpleNamespace(
+        model_dtype=model_dtype,
+        descriptor_precision="float32",
+        fitting_precision="float32",
+        do_atomic_virial=False,
+    )
+
+    metadata = opt1._evaluator_metadata(evaluator)
+
+    assert metadata == {
+        "model_precision": expected,
+        "model_interface_precision": expected,
+        "checkpoint_descriptor_precision": "float32",
+        "checkpoint_fitting_precision": "float32",
+        "do_atomic_virial": False,
+    }
 
 
 def test_opt1_matches_high_precision_baseline_interface() -> None:

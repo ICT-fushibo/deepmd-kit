@@ -206,6 +206,81 @@ def nv_search_matrix(
     return coord, cell, neighbor_matrix, num_neighbors, shifts
 
 
+def nv_search_matrix_fixed(
+    coord: torch.Tensor,
+    box: torch.Tensor | None,
+    rcut: float,
+    *,
+    capacity: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Run one fixed-capacity nvalchemiops search without host synchronization.
+
+    This is an opt-in eager-MD companion to :func:`nv_search_matrix`.  Capacity
+    discovery belongs in an initialization preflight.  During MD, an async
+    device assertion detects overflow, preserving correctness without reading
+    ``num_neighbors.max()`` back to Python or dynamically re-running the search.
+    """
+    if capacity <= 0:
+        raise ValueError("capacity must be positive")
+    from nvalchemiops.torch.neighbors import (
+        neighbor_list,
+    )
+
+    device = coord.device
+    nf, nloc = coord.shape[:2]
+    periodic = box is not None
+    with _input_device_context(device):
+        if periodic:
+            cell = box.reshape(nf, 3, 3).to(device=device, dtype=coord.dtype)
+            coord = normalize_coord(coord, cell)
+            pbc = torch.ones((nf, 3), dtype=torch.bool, device=device)
+        else:
+            cell = None
+            pbc = None
+
+        positions = coord.reshape(nf * nloc, 3).detach()
+        batch_idx = torch.arange(
+            nf, dtype=torch.int32, device=device
+        ).repeat_interleave(nloc)
+        batch_ptr = torch.arange(nf + 1, dtype=torch.int32, device=device) * nloc
+        method = choose_nv_nlist_method(nloc, periodic=periodic, device=device)
+        extra_nl_kwargs: dict[str, Any] = {}
+        if method == "batch_naive":
+            extra_nl_kwargs["max_atoms_per_system"] = int(nloc)
+        nlist_result = neighbor_list(
+            positions,
+            float(rcut),
+            cell=cell,
+            pbc=pbc,
+            batch_idx=batch_idx,
+            batch_ptr=batch_ptr,
+            method=method,
+            max_neighbors=int(capacity),
+            return_neighbor_list=False,
+            wrap_positions=False,
+            **extra_nl_kwargs,
+        )
+        if len(nlist_result) == 2:
+            neighbor_matrix, num_neighbors = nlist_result
+            shifts = torch.zeros(
+                (*neighbor_matrix.shape, 3), dtype=torch.int32, device=device
+            )
+        else:
+            neighbor_matrix, num_neighbors, shifts = nlist_result
+        torch._assert_async(
+            torch.all(num_neighbors <= capacity),
+            "fixed nvalchemiops neighbor capacity exceeded; increase "
+            "neighbor_search_capacity and retry",
+        )
+    return coord, cell, neighbor_matrix, num_neighbors, shifts
+
+
 def build_neighbor_graph_nv(
     coord: Any,
     atype: Any,
