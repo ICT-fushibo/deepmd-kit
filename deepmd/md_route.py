@@ -25,6 +25,11 @@ from md_benchmark.md_route import (
 
 
 _DEEPMD_BASELINE_ENV = {
+    # DeepMD reads this once when its backend is first imported.  Pin the
+    # scientific baseline to the documented high-precision interface so a
+    # caller's shell cannot change baseline/Opt1 parity.  Checkpoint component
+    # precision (for example FP32 descriptor weights) remains unchanged.
+    "DP_INTERFACE_PREC": "high",
     "DP_ACT_INFER": "0",
     "DP_COMPILE_INFER": "0",
     "DP_CUDA_INFER": "0",

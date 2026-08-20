@@ -1,11 +1,12 @@
 """DPA4 Opt1: eager GPU-resident molecular dynamics.
 
 The FP64 positions, momenta, forces, thermostat variables, and integration
-state live on one CUDA device for the full trajectory.  The released FP32
-DPA4/SeZM ``.pt`` checkpoint is loaded eagerly (with DeepMD's interface
-precision explicitly pinned to FP32) and keeps its model-owned
-nvalchemiops edge builder.  CUDA Graph, ``torch.compile``, Triton/CuTe kernels,
-AMP, TF32, and model-specific fusion are deliberately disabled at this stage.
+state live on one CUDA device for the full trajectory.  The DPA4/SeZM ``.pt``
+checkpoint is loaded eagerly with the same high-precision DeepMD interface as
+the scientific baseline; checkpoint-defined neural-network precision remains
+unchanged.  The model keeps its model-owned nvalchemiops edge builder.  CUDA
+Graph, ``torch.compile``, Triton/CuTe kernels, AMP, TF32, and model-specific
+fusion are deliberately disabled at this stage.
 
 Only requested observations/trajectory frames and the final state cross the
 device boundary.  The per-step force call consumes and returns CUDA tensors;
@@ -42,12 +43,11 @@ from md_benchmark.md_route import (
 
 
 _DEEPMD_OPT1_ENV = {
-    # DeepMD defaults DP_INTERFACE_PREC to ``high`` (FP64).  The released
-    # DPA4 checkpoint is trained/exported with FP32 interface semantics, and
-    # get_model() uses this process-wide setting when constructing SeZM.
-    # Pin it before importing deepmd.pt so an inherited shell setting cannot
-    # silently instantiate a double-precision model.
-    "DP_INTERFACE_PREC": "low",
+    # This process-wide setting is read when deepmd.pt is first imported.
+    # Match the scientific baseline explicitly.  It controls the model
+    # interface/environment-matrix dtype, not the checkpoint's descriptor and
+    # fitting-network precision settings.
+    "DP_INTERFACE_PREC": "high",
     "DP_ACT_INFER": "0",
     "DP_COMPILE_INFER": "0",
     "DP_CUDA_INFER": "0",
@@ -59,7 +59,7 @@ _DEEPMD_OPT1_ENV = {
 
 
 def _configure_opt1() -> None:
-    """Pin eager execution and released-checkpoint FP32 policy."""
+    """Pin eager execution and the scientific-baseline interface policy."""
     configure_torch_baseline()
     os.environ.update(_DEEPMD_OPT1_ENV)
 
@@ -123,10 +123,10 @@ class DPA4EnergyForceEvaluator:
                 "DPA4 Opt1 supports only the conservative energy/force head"
             )
         model_dtype = model.global_pt_float_precision
-        if model_dtype is not torch.float32:
+        if model_dtype not in (torch.float32, torch.float64):
             raise ValueError(
-                "DPA4 Opt1 currently fixes released-checkpoint FP32 semantics; "
-                f"checkpoint model precision is {model_dtype}"
+                "DPA4 Opt1 supports float32/float64 DeepMD interfaces; "
+                f"loaded interface precision is {model_dtype}"
             )
         if any(parameter.device != self.device for parameter in model.parameters()):
             raise RuntimeError("DPA4 model parameters did not all load on CUDA")
@@ -140,15 +140,23 @@ class DPA4EnergyForceEvaluator:
         self.neighbor_backend = "dpa4-internal-nvalchemiops-eager"
 
         definition = json.loads(model.model_def_script)
-        descriptor_type = str(definition.get("descriptor", {}).get("type", ""))
+        descriptor_definition = definition.get("descriptor", {})
+        fitting_definition = definition.get("fitting_net", {})
+        descriptor_type = str(descriptor_definition.get("type", ""))
         model_type = str(definition.get("type", ""))
         if "dpa4" not in {descriptor_type.lower(), model_type.lower()}:
             raise ValueError(
                 "The requested checkpoint does not identify as DPA4/SeZM: "
                 f"model type={model_type!r}, descriptor type={descriptor_type!r}"
             )
-        fitting_type = str(definition.get("fitting_net", {}).get("type", ""))
+        fitting_type = str(fitting_definition.get("type", ""))
         self.legacy_fitting_type_normalized = fitting_type == "ener"
+        self.descriptor_precision = str(
+            descriptor_definition.get("precision", "checkpoint-default")
+        )
+        self.fitting_precision = str(
+            fitting_definition.get("precision", "checkpoint-default")
+        )
 
         type_index = {
             symbol: index for index, symbol in enumerate(model.get_type_map())
@@ -331,6 +339,11 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "neighbor_rebuilt_each_force_evaluation": True,
         "md_state_precision": "float64",
         "model_precision": str(evaluator.model_dtype).removeprefix("torch."),
+        "model_interface_precision": str(evaluator.model_dtype).removeprefix(
+            "torch."
+        ),
+        "checkpoint_descriptor_precision": evaluator.descriptor_precision,
+        "checkpoint_fitting_precision": evaluator.fitting_precision,
         "stress_convention": "ase-tensile=-sym(deepmd-virial)/volume",
         "legacy_fitting_type_compatibility": (
             "ener-normalized-in-memory-to-dpa4_ener"
