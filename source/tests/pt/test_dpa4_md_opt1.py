@@ -88,6 +88,10 @@ def test_hot_force_path_has_no_host_or_numpy_conversion() -> None:
     assert ".item(" not in source
 
 
+def test_opt1_pins_released_checkpoint_interface_precision_to_fp32() -> None:
+    assert opt1._DEEPMD_OPT1_ENV["DP_INTERFACE_PREC"] == "low"
+
+
 def test_integrators_are_the_ase_aligned_gpu_implementations() -> None:
     from deepmd.md_stages.dpa3 import opt1 as shared
 

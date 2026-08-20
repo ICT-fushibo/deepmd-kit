@@ -2,7 +2,8 @@
 
 The FP64 positions, momenta, forces, thermostat variables, and integration
 state live on one CUDA device for the full trajectory.  The released FP32
-DPA4/SeZM ``.pt`` checkpoint is loaded eagerly and keeps its model-owned
+DPA4/SeZM ``.pt`` checkpoint is loaded eagerly (with DeepMD's interface
+precision explicitly pinned to FP32) and keeps its model-owned
 nvalchemiops edge builder.  CUDA Graph, ``torch.compile``, Triton/CuTe kernels,
 AMP, TF32, and model-specific fusion are deliberately disabled at this stage.
 
@@ -41,6 +42,12 @@ from md_benchmark.md_route import (
 
 
 _DEEPMD_OPT1_ENV = {
+    # DeepMD defaults DP_INTERFACE_PREC to ``high`` (FP64).  The released
+    # DPA4 checkpoint is trained/exported with FP32 interface semantics, and
+    # get_model() uses this process-wide setting when constructing SeZM.
+    # Pin it before importing deepmd.pt so an inherited shell setting cannot
+    # silently instantiate a double-precision model.
+    "DP_INTERFACE_PREC": "low",
     "DP_ACT_INFER": "0",
     "DP_COMPILE_INFER": "0",
     "DP_CUDA_INFER": "0",
@@ -52,7 +59,7 @@ _DEEPMD_OPT1_ENV = {
 
 
 def _configure_opt1() -> None:
-    """Pin eager, non-reduced-precision policy before constructing SeZM."""
+    """Pin eager execution and released-checkpoint FP32 policy."""
     configure_torch_baseline()
     os.environ.update(_DEEPMD_OPT1_ENV)
 
@@ -323,7 +330,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "neighborlist_backend": evaluator.neighbor_backend,
         "neighbor_rebuilt_each_force_evaluation": True,
         "md_state_precision": "float64",
-        "model_precision": "float32",
+        "model_precision": str(evaluator.model_dtype).removeprefix("torch."),
         "stress_convention": "ase-tensile=-sym(deepmd-virial)/volume",
         "legacy_fitting_type_compatibility": (
             "ener-normalized-in-memory-to-dpa4_ener"
