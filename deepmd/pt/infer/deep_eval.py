@@ -766,6 +766,15 @@ class DeepEval(DeepEvalBackend):
         output so the caller's extraction is unchanged.
         """
         inner = self.dp.model["Default"]
+        # Non-spin TorchScript checkpoints do not expose ``charge_spin`` in
+        # their forward schema. Passing it as ``None`` is still rejected as an
+        # unknown keyword, so only include it for spin-aware models.
+        lower_kwargs: dict[str, Any] = {
+            "fparam": fparam,
+            "aparam": aparam,
+        }
+        if charge_spin is not None:
+            lower_kwargs["charge_spin"] = charge_spin
         if self._uses_edge_schema:
             edge_schema = self._nlist_builder.build(
                 coord,
@@ -782,9 +791,7 @@ class DeepEval(DeepEvalBackend):
                 edge_schema.edge_vec,
                 edge_schema.edge_scatter_index,
                 edge_schema.edge_mask,
-                fparam=fparam,
-                aparam=aparam,
-                charge_spin=charge_spin,
+                **lower_kwargs,
                 input_prec=coord.dtype,
             )
         else:
@@ -800,10 +807,8 @@ class DeepEval(DeepEvalBackend):
                 ext_atype,
                 nlist,
                 mapping,
-                fparam=fparam,
-                aparam=aparam,
+                **lower_kwargs,
                 do_atomic_virial=do_atomic_virial,
-                charge_spin=charge_spin,
             )
             predict = communicate_extended_output(
                 model_lower,
