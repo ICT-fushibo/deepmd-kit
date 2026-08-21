@@ -40,6 +40,10 @@ from md_benchmark.md_route import (
     configure_torch_baseline,
     validate_result,
 )
+from md_benchmark.performance import (
+    CudaPhaseProfiler,
+    performance_profile_requested,
+)
 
 
 _DEEPMD_OPT1_ENV = {
@@ -89,11 +93,16 @@ class DPA4EnergyForceEvaluator:
         model_path: str | Path,
         *,
         device: str | torch.device,
+        profiler: CudaPhaseProfiler | None = None,
     ) -> None:
         self.device = torch.device(device)
         if self.device.type != "cuda" or not torch.cuda.is_available():
             raise RuntimeError("DPA4 Opt1 requires an available CUDA device")
         checkpoint_path = _require_raw_pt(model_path)
+        self.profiler = profiler or CudaPhaseProfiler(
+            enabled=False,
+            device=self.device,
+        )
 
         # DPA4Wrapper is the checkpoint compatibility authority.  It loads the
         # raw weights into an eager SeZMModel.  In particular, the released
@@ -139,6 +148,14 @@ class DPA4EnergyForceEvaluator:
             raise RuntimeError("DPA4 model buffers did not all load on CUDA")
 
         self._model = model.eval()
+        if self.profiler.enabled:
+            original_build_neighbor_list = self._model.build_neighbor_list
+
+            def profiled_build_neighbor_list(*args: Any, **kwargs: Any) -> Any:
+                with self.profiler.phase("neighbor_list"):
+                    return original_build_neighbor_list(*args, **kwargs)
+
+            self._model.build_neighbor_list = profiled_build_neighbor_list
         for parameter in self._model.parameters():
             parameter.requires_grad_(False)
         self.model_dtype = model_dtype
@@ -249,17 +266,19 @@ class DPA4EnergyForceEvaluator:
         # same CUDA device.  ``DP_COMPILE_INFER=0`` selects eager core_compute;
         # the edge-list path does not use NvNeighborList's optional compiled
         # dense-list truncation helper.
-        model_positions = positions.to(dtype=self.model_dtype).unsqueeze(0)
-        with torch.enable_grad(), torch.cuda.device(self.device):
-            output = self._model(
-                model_positions,
-                self.atom_types,
-                box=self.cell,
-                fparam=self.fparam,
-                aparam=self.aparam,
-                do_atomic_virial=self.do_atomic_virial,
-                charge_spin=self.charge_spin,
-            )
+        with self.profiler.phase("model_input"):
+            model_positions = positions.to(dtype=self.model_dtype).unsqueeze(0)
+        with self.profiler.phase("model_energy_force"):
+            with torch.enable_grad(), torch.cuda.device(self.device):
+                output = self._model(
+                    model_positions,
+                    self.atom_types,
+                    box=self.cell,
+                    fparam=self.fparam,
+                    aparam=self.aparam,
+                    do_atomic_virial=self.do_atomic_virial,
+                    charge_spin=self.charge_spin,
+                )
         try:
             force = output["force"].reshape(-1, 3).detach()
             energy = output["energy"].reshape(-1)[0].detach()
@@ -329,7 +348,16 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     )
     state = GPUMDState(positions=positions, momenta=momenta)
     initial_state = state.initial_clone()
-    evaluator = DPA4EnergyForceEvaluator(atoms, request.model_path, device=device)
+    profiler = CudaPhaseProfiler(
+        enabled=performance_profile_requested(request.options),
+        device=device,
+    )
+    evaluator = DPA4EnergyForceEvaluator(
+        atoms,
+        request.model_path,
+        device=device,
+        profiler=profiler,
+    )
 
     if request.config.warmup_steps:
         warmup_integrator = _build_integrator(request, masses)
@@ -341,7 +369,12 @@ def run_md(request: MDRunRequest) -> MDRunResult:
 
     integrator = _build_integrator(request, masses)
     elapsed, observations, trajectory, trajectory_path = _run_measured_loop(
-        request, state, evaluator, integrator, masses
+        request,
+        state,
+        evaluator,
+        integrator,
+        masses,
+        profiler,
     )
     final_atoms = _state_to_atoms(atoms, state)
     metadata = {
@@ -372,6 +405,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "hot_loop_numpy_roundtrip": False,
         "trajectory_frame_semantics": "step-0-plus-record-interval",
         "deepmd_inference_env": dict(_DEEPMD_OPT1_ENV),
+        "performance_profile": profiler.summary(synchronize=False),
     }
     if request.config.integrator == "nose_hoover_chain":
         metadata["nose_hoover_chain"] = {

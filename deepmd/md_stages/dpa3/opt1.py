@@ -31,6 +31,10 @@ from md_benchmark.md_route import (
     configure_torch_baseline,
     validate_result,
 )
+from md_benchmark.performance import (
+    CudaPhaseProfiler,
+    performance_profile_requested,
+)
 
 
 _DEEPMD_OPT1_ENV = {
@@ -76,6 +80,7 @@ class DPA3EnergyForceEvaluator:
         neighbor_capacity_factor: float = 1.25,
         neighbor_capacity_headroom: int = 16,
         neighbor_search_capacity: int | None = None,
+        profiler: CudaPhaseProfiler | None = None,
     ) -> None:
         self.device = torch.device(device)
         if self.device.type != "cuda" or not torch.cuda.is_available():
@@ -85,6 +90,10 @@ class DPA3EnergyForceEvaluator:
                 "DPA3 Opt1 requires the frozen TorchScript '.pth' checkpoint; "
                 f"got {model_path!s}"
             )
+        self.profiler = profiler or CudaPhaseProfiler(
+            enabled=False,
+            device=self.device,
+        )
 
         # Import after the inference environment is pinned.  DeepPot remains
         # the checkpoint/type-map authority; its numpy eval API is never used.
@@ -107,6 +116,14 @@ class DPA3EnergyForceEvaluator:
         # of Opt1.  The default=True path remains unchanged for all other users.
         backend._nlist_builder.compile_truncation = False
         self._backend = backend
+        if self.profiler.enabled:
+            original_nlist_build = backend._nlist_builder.build
+
+            def profiled_nlist_build(*args: Any, **kwargs: Any) -> Any:
+                with self.profiler.phase("neighbor_list"):
+                    return original_nlist_build(*args, **kwargs)
+
+            backend._nlist_builder.build = profiled_nlist_build
         self._module = backend.dp.to(self.device)
         self._module.eval()
         for parameter in self._module.parameters():
@@ -244,19 +261,21 @@ class DPA3EnergyForceEvaluator:
                 f"positions shape {tuple(positions.shape)} does not match "
                 f"({self.atom_types.shape[1]}, 3)"
             )
-        model_positions = positions.to(dtype=self.model_dtype).unsqueeze(0)
+        with self.profiler.phase("model_input"):
+            model_positions = positions.to(dtype=self.model_dtype).unsqueeze(0)
         # Conservative force/virial generation uses autograd inside the DPA3
         # model.  Model parameters are frozen by inference-only ModelWrapper.
-        with torch.enable_grad(), torch.cuda.device(self.device):
-            output = self._backend._eval_lower_strategy(
-                model_positions,
-                self.atom_types,
-                self.cell,
-                self.fparam,
-                self.aparam,
-                self.charge_spin,
-                False,
-            )
+        with self.profiler.phase("model_energy_force"):
+            with torch.enable_grad(), torch.cuda.device(self.device):
+                output = self._backend._eval_lower_strategy(
+                    model_positions,
+                    self.atom_types,
+                    self.cell,
+                    self.fparam,
+                    self.aparam,
+                    self.charge_spin,
+                    False,
+                )
         try:
             force = output["force"].reshape(-1, 3).detach()
             energy = output["energy"].reshape(-1)[0].detach()
@@ -549,6 +568,7 @@ def _run_measured_loop(
     evaluator: EnergyForceEvaluator,
     integrator: _Integrator,
     masses: Tensor,
+    profiler: CudaPhaseProfiler | None = None,
 ) -> tuple[float, list[MDObservation], list[Atoms] | None, str | None]:
     config = request.config
     observations: list[MDObservation] = []
@@ -560,8 +580,14 @@ def _run_measured_loop(
 
     torch.cuda.reset_peak_memory_stats(evaluator.device)
     torch.cuda.synchronize(evaluator.device)
+    if profiler is not None:
+        profiler.start()
     started = time.perf_counter()
-    _evaluate_state(state, evaluator)
+    if profiler is None:
+        _evaluate_state(state, evaluator)
+    else:
+        with profiler.phase("initial_force"):
+            _evaluate_state(state, evaluator)
     if config.collect_trajectory:
         _append_trajectory(
             _state_to_atoms(request.atoms, state, step=0),
@@ -570,7 +596,11 @@ def _run_measured_loop(
         )
 
     for step in range(1, config.steps + 1):
-        integrator.step(state, evaluator)
+        if profiler is None:
+            integrator.step(state, evaluator)
+        else:
+            with profiler.phase("md_step"):
+                integrator.step(state, evaluator)
         if config.collect_statistics and step in observation_steps:
             observations.append(_observation(step, state, masses))
         if config.collect_trajectory and step % config.record_interval == 0:
@@ -580,6 +610,8 @@ def _run_measured_loop(
                 partial_path=partial_path,
             )
     torch.cuda.synchronize(evaluator.device)
+    if profiler is not None:
+        profiler.stop()
     elapsed = time.perf_counter() - started
     if final_path is not None and partial_path is not None:
         os.replace(partial_path, final_path)
@@ -635,6 +667,10 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     )
     state = GPUMDState(positions=positions, momenta=momenta)
     initial_state = state.initial_clone()
+    profiler = CudaPhaseProfiler(
+        enabled=performance_profile_requested(request.options),
+        device=device,
+    )
     configured_capacity = request.options.get("neighbor_search_capacity")
     evaluator = DPA3EnergyForceEvaluator(
         atoms,
@@ -649,6 +685,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         neighbor_search_capacity=(
             None if configured_capacity is None else int(configured_capacity)
         ),
+        profiler=profiler,
     )
 
     if request.config.warmup_steps:
@@ -661,7 +698,12 @@ def run_md(request: MDRunRequest) -> MDRunResult:
 
     integrator = _build_integrator(request, masses)
     elapsed, observations, trajectory, trajectory_path = _run_measured_loop(
-        request, state, evaluator, integrator, masses
+        request,
+        state,
+        evaluator,
+        integrator,
+        masses,
+        profiler,
     )
     final_atoms = _state_to_atoms(atoms, state)
     metadata = {
@@ -684,6 +726,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "hot_loop_numpy_roundtrip": False,
         "trajectory_frame_semantics": "step-0-plus-record-interval",
         "deepmd_inference_env": dict(_DEEPMD_OPT1_ENV),
+        "performance_profile": profiler.summary(synchronize=False),
     }
     if request.config.integrator == "nose_hoover_chain":
         metadata["nose_hoover_chain"] = {
