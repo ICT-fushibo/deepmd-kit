@@ -93,6 +93,28 @@ def test_rewrite_capture_unsafe_scalar_zero_uses_device_allocation() -> None:
     )
 
 
+def test_rewrite_capture_unsafe_boolean_index_put_uses_masked_fill() -> None:
+    function = torch.jit.CompilationUnit(
+        """
+        def sanitize_padding(x: Tensor) -> Tensor:
+            x[x == -1] = 0
+            return x
+        """
+    ).sanitize_padding
+    assert any(node.kind() == "aten::index_put_" for node in function.graph.nodes())
+
+    opt2._rewrite_capture_unsafe_scalar_zeros_(function.graph)
+    assert opt2._rewrite_capture_unsafe_index_put_zeros_(function.graph) == 1
+    function._debug_flush_compilation_cache()
+    assert not any(node.kind() == "aten::index_put_" for node in function.graph.nodes())
+    assert any(node.kind() == "aten::masked_fill_" for node in function.graph.nodes())
+    values = torch.tensor([-1, 4, -1], dtype=torch.int64)
+    torch.testing.assert_close(
+        function(values),
+        torch.tensor([0, 4, 0], dtype=torch.int64),
+    )
+
+
 def test_replay_mock_reuses_static_input_and_output_addresses() -> None:
     dynamic = (
         torch.randn(1, 6, 3, device=_CPU),

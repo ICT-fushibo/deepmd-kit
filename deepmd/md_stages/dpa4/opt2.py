@@ -418,24 +418,34 @@ class DPA4ModelOnlyGraphEvaluator(DPA4EnergyForceEvaluator):
                 self.validation_energy_abs_error,
                 self.validation_virial_max_abs_error,
             ) = validation_errors
+            atom_count = int(self.atom_types.shape[1])
             failures = []
-            for name, replay_error, validation_error, tolerance in (
+            for (
+                name,
+                replay_error,
+                fixed_error,
+                ragged_error,
+                tolerance,
+            ) in (
                 (
                     "force",
                     self.replay_stability_force_max_abs_error,
-                    self.validation_force_max_abs_error,
+                    fixed_eager_errors[0],
+                    ragged_eager_errors[0],
                     self.validation_force_atol,
                 ),
                 (
                     "energy",
                     self.replay_stability_energy_abs_error,
-                    self.validation_energy_abs_error,
+                    fixed_eager_errors[1],
+                    ragged_eager_errors[1],
                     self.validation_energy_atol,
                 ),
                 (
                     "virial",
                     self.replay_stability_virial_max_abs_error,
-                    self.validation_virial_max_abs_error,
+                    fixed_eager_errors[2],
+                    ragged_eager_errors[2],
                     self.validation_virial_atol,
                 ),
             ):
@@ -444,10 +454,21 @@ class DPA4ModelOnlyGraphEvaluator(DPA4EnergyForceEvaluator):
                         f"{name} replay error {replay_error:.6g} > "
                         f"{tolerance:.6g}"
                     )
-                if validation_error > tolerance:
+                if fixed_error > tolerance:
                     failures.append(
-                        f"{name} eager error {validation_error:.6g} > "
+                        f"{name} fixed eager error {fixed_error:.6g} > "
                         f"{tolerance:.6g}"
+                    )
+                # Fixed-capacity and ragged reductions can differ by roundoff.
+                # Keep force/virial absolute tolerances unchanged, but express
+                # total-energy parity as the configured per-atom tolerance.
+                ragged_tolerance = (
+                    tolerance * atom_count if name == "energy" else tolerance
+                )
+                if ragged_error > ragged_tolerance:
+                    failures.append(
+                        f"{name} ragged eager error {ragged_error:.6g} > "
+                        f"{ragged_tolerance:.6g}"
                     )
             if failures:
                 raise RuntimeError("; ".join(failures))

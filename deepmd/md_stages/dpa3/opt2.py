@@ -188,6 +188,53 @@ def _rewrite_capture_unsafe_scalar_zeros_(graph: Any) -> int:
     return replacements
 
 
+def _rewrite_capture_unsafe_index_put_zeros_(graph: Any) -> int:
+    """Replace boolean zero ``index_put_`` with capture-safe ``masked_fill_``.
+
+    Older released DPA3 archives implement ``x[x == -1] = 0`` through
+    ``aten::index_put_``.  CUDA implements that boolean-index assignment via a
+    dynamic-shape path, which is forbidden during stream capture.  The
+    neighbor-list operation has exactly one boolean mask, a scalar zero value,
+    and ``accumulate=False``; ``masked_fill_`` has identical semantics without
+    the capture-unsafe dynamic indexing machinery.
+    """
+
+    replacements = 0
+    for node in list(_iter_jit_nodes(graph)):
+        if node.kind() != "aten::index_put_":
+            continue
+        inputs = list(node.inputs())
+        if len(inputs) != 4 or inputs[3].toIValue() is not False:
+            continue
+        indices = inputs[1].node()
+        if indices.kind() != "prim::ListConstruct":
+            continue
+        masks = list(indices.inputs())
+        if len(masks) != 1:
+            continue
+        value_node = inputs[2].node()
+        if value_node.kind() not in {"aten::tensor", "aten::zeros"}:
+            continue
+
+        zero = graph.insertConstant(0)
+        zero.node().moveBefore(node)
+        masked_fill = graph.create(
+            "aten::masked_fill_",
+            [inputs[0], masks[0], zero],
+            1,
+        )
+        masked_fill.output().setType(node.output().type())
+        masked_fill.insertBefore(node)
+        node.output().replaceAllUsesWith(masked_fill.output())
+        node.destroy()
+        replacements += 1
+
+    if replacements:
+        torch._C._jit_pass_dce(graph)
+        graph.lint()
+    return replacements
+
+
 def _patch_released_dpa3_jit_for_capture_(model: Any) -> int:
     """Patch only Repflows TorchScript methods and flush their execution plans."""
     replacements = 0
@@ -202,6 +249,9 @@ def _patch_released_dpa3_jit_for_capture_(model: Any) -> int:
         for method_name in script_module._method_names():
             method = script_module._get_method(method_name)
             method_replacements = _rewrite_capture_unsafe_scalar_zeros_(
+                method.graph
+            )
+            method_replacements += _rewrite_capture_unsafe_index_put_zeros_(
                 method.graph
             )
             if method_replacements:
@@ -323,10 +373,14 @@ class DPA3ModelCUDAGraphEvaluator:
         # Conservative forces and virials are generated through autograd.grad
         # inside forward_common_lower, so grad must remain enabled in capture.
         with torch.enable_grad():
+            # Released DPA3 archives sanitize padding indices in-place.  Pass a
+            # captured clone so that warmup/capture/replay never corrupt the
+            # persistent fixed-address input copied by the eager neighbor path.
+            model_nlist = self.static_inputs.nlist.clone()
             model_lower = self._inner.forward_common_lower(
                 self.static_inputs.extended_coord,
                 self.static_inputs.extended_atype,
-                self.static_inputs.nlist,
+                model_nlist,
                 self.static_inputs.mapping,
                 **lower_kwargs,
                 do_atomic_virial=False,
