@@ -234,25 +234,94 @@ def _rewrite_capture_unsafe_index_put_zeros_(graph: Any) -> int:
     return replacements
 
 
+def _rewrite_capture_unsafe_tensor_conditionals_(graph: Any) -> int:
+    """Inline custom-activation branches guarded by ``bool(torch.any(...))``.
+
+    Released DPA3 custom SiLU modules skip their tanh tail when no element is
+    above the transition threshold.  The then branch already uses
+    ``torch.where`` and is valid for both cases, while evaluating the tensor
+    condition as a Python bool performs a capture-forbidden device sync.
+    """
+    replacements = 0
+    for node in list(_iter_jit_nodes(graph)):
+        if node.kind() != "prim::If":
+            continue
+        inputs = list(node.inputs())
+        blocks = list(node.blocks())
+        if len(inputs) != 1 or len(blocks) != 2:
+            continue
+        bool_node = inputs[0].node()
+        if bool_node.kind() != "aten::Bool":
+            continue
+        bool_inputs = list(bool_node.inputs())
+        if len(bool_inputs) != 1 or bool_inputs[0].node().kind() != "aten::any":
+            continue
+        if len(list(node.outputs())) != 1:
+            continue
+        then_block, else_block = blocks
+        then_return = list(then_block.returnNode().inputs())
+        else_return = list(else_block.returnNode().inputs())
+        if len(then_return) != 1 or len(else_return) != 1:
+            continue
+        if then_return[0].node().kind() != "aten::where":
+            continue
+        where_inputs = list(then_return[0].node().inputs())
+        if else_return[0] not in where_inputs[1:]:
+            continue
+
+        value_map: dict[Any, Any] = {}
+
+        def remap(value: Any) -> Any:
+            return value_map.get(value, value)
+
+        for branch_node in list(then_block.nodes()):
+            clone = graph.createClone(branch_node, remap)
+            clone.insertBefore(node)
+            for original, replacement in zip(
+                branch_node.outputs(), clone.outputs(), strict=True
+            ):
+                value_map[original] = replacement
+        node.output().replaceAllUsesWith(remap(then_return[0]))
+        node.destroy()
+        replacements += 1
+
+    if replacements:
+        torch._C._jit_pass_dce(graph)
+        graph.lint()
+    return replacements
+
+
 def _patch_released_dpa3_jit_for_capture_(model: Any) -> int:
     """Patch only Repflows TorchScript methods and flush their execution plans."""
     replacements = 0
     for module_name, module in model.named_modules():
         module_type = type(module).__name__
         qualified_name = str(getattr(getattr(module, "_c", None), "qualified_name", ""))
-        if "repflow" not in f"{module_name} {module_type} {qualified_name}".lower():
+        module_label = f"{module_name} {module_type} {qualified_name}".lower()
+        normalized_label = module_label.replace("_", "")
+        is_repflow = "repflow" in module_label
+        is_custom_activation = (
+            "customsilu" in normalized_label or "customdsilu" in normalized_label
+        )
+        if not is_repflow and not is_custom_activation:
             continue
         script_module = getattr(module, "_c", None)
         if script_module is None:
             continue
         for method_name in script_module._method_names():
             method = script_module._get_method(method_name)
-            method_replacements = _rewrite_capture_unsafe_scalar_zeros_(
-                method.graph
-            )
-            method_replacements += _rewrite_capture_unsafe_index_put_zeros_(
-                method.graph
-            )
+            method_replacements = 0
+            if is_repflow:
+                method_replacements += _rewrite_capture_unsafe_scalar_zeros_(
+                    method.graph
+                )
+                method_replacements += _rewrite_capture_unsafe_index_put_zeros_(
+                    method.graph
+                )
+            if is_custom_activation:
+                method_replacements += _rewrite_capture_unsafe_tensor_conditionals_(
+                    method.graph
+                )
             if method_replacements:
                 method._debug_flush_compilation_cache()
                 replacements += method_replacements

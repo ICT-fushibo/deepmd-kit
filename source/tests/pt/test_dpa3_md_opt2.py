@@ -115,6 +115,32 @@ def test_rewrite_capture_unsafe_boolean_index_put_uses_masked_fill() -> None:
     )
 
 
+def test_rewrite_capture_unsafe_tensor_conditional_inlines_where_branch() -> None:
+    function = torch.jit.CompilationUnit(
+        """
+        def custom_activation(x: Tensor, threshold: float) -> Tensor:
+            silu = torch.nn.functional.silu(x)
+            mask = x > threshold
+            if torch.any(mask):
+                tail = torch.tanh(x - threshold)
+                return torch.where(x < threshold, silu, tail)
+            return silu
+        """
+    ).custom_activation
+    assert any(node.kind() == "prim::If" for node in function.graph.nodes())
+
+    assert opt2._rewrite_capture_unsafe_tensor_conditionals_(function.graph) == 1
+    function._debug_flush_compilation_cache()
+    assert not any(node.kind() == "prim::If" for node in function.graph.nodes())
+    values = torch.tensor([-2.0, 1.0], device=_CPU)
+    expected = torch.where(
+        values < 0.0,
+        torch.nn.functional.silu(values),
+        torch.tanh(values),
+    )
+    torch.testing.assert_close(function(values, 0.0), expected)
+
+
 def test_replay_mock_reuses_static_input_and_output_addresses() -> None:
     dynamic = (
         torch.randn(1, 6, 3, device=_CPU),
