@@ -138,7 +138,7 @@ def test_rewrite_capture_unsafe_boolean_index_put_uses_masked_fill() -> None:
     "assignment",
     [
         "2",
-        "torch.zeros(2)",
+        "torch.zeros(2, device=x.device)",
     ],
 )
 def test_rewrite_boolean_index_put_rejects_non_scalar_zero(assignment) -> None:
@@ -162,7 +162,7 @@ def test_rewrite_boolean_index_put_accepts_scalar_zeros() -> None:
     function = torch.jit.CompilationUnit(
         """
         def assign_zero(x: Tensor) -> Tensor:
-            x[x == -1] = torch.zeros(())
+            x[x == -1] = torch.zeros((), device=x.device)
             return x
         """
     ).assign_zero
@@ -203,7 +203,7 @@ def test_rewrite_capture_unsafe_tensor_conditional_inlines_where_branch() -> Non
 def test_model_patch_does_not_depend_on_archive_module_names() -> None:
     model = torch.jit.script(_ObscuredContainer())
     # Materialize the parent execution plan before mutating its nested child.
-    model(torch.tensor([-1.0, 1.0]), 0.0)
+    model(torch.tensor([-1.0, 1.0], device=_CPU), 0.0)
 
     stats = opt2._patch_released_dpa3_jit_for_capture_(model)
 
@@ -232,6 +232,93 @@ def test_model_patch_rejects_unhandled_tensor_conditional(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="left 1 capture-unsafe"):
         opt2._patch_released_dpa3_jit_for_capture_(model)
+
+
+def test_fixed_neighbor_slot_configuration() -> None:
+    kwargs = {"capacity_factor": 1.25, "capacity_headroom": 16}
+    assert opt2._resolve_fixed_neighbor_slots(None, 1200, 100, **kwargs) == 125
+    assert opt2._resolve_fixed_neighbor_slots(None, 1200, 40, **kwargs) == 56
+    assert opt2._resolve_fixed_neighbor_slots(128, 1200, 100, **kwargs) == 128
+    with pytest.raises(ValueError, match="must be positive"):
+        opt2._resolve_fixed_neighbor_slots(0, 1200, 0, **kwargs)
+    with pytest.raises(ValueError, match="smaller than the initial"):
+        opt2._resolve_fixed_neighbor_slots(99, 1200, 100, **kwargs)
+    with pytest.raises(ValueError, match="exceeds checkpoint"):
+        opt2._resolve_fixed_neighbor_slots(1201, 1200, 100, **kwargs)
+
+
+def test_static_dynamic_indices_and_edge_reduction_match_compact() -> None:
+    from deepmd.pt.model.descriptor.repflows import _get_static_graph_index
+    from deepmd.pt.model.network.utils import aggregate, get_graph_index
+
+    # Padding is already sanitized to atom index 0, matching repflows.forward.
+    nlist = torch.tensor([[[1, 2, 0], [0, 0, 0]]], device=_CPU)
+    nlist_mask = torch.tensor(
+        [[[True, True, False], [True, False, False]]], device=_CPU
+    )
+    a_mask = nlist_mask[:, :, :2]
+    compact_edge, compact_angle = get_graph_index(
+        nlist,
+        nlist_mask,
+        a_mask,
+        3,
+        True,
+    )
+    static_edge, static_angle = _get_static_graph_index(
+        nlist,
+        a_mask,
+        3,
+        True,
+    )
+
+    assert static_edge.shape == (2, 6)
+    assert static_angle.shape == (3, 8)
+    torch.testing.assert_close(
+        static_edge[:, nlist_mask.reshape(-1)], compact_edge
+    )
+
+    dense_message = torch.tensor(
+        [[1.0], [2.0], [50.0], [3.0], [60.0], [70.0]], device=_CPU
+    )
+    dense_message = dense_message * nlist_mask.reshape(-1, 1)
+    compact_message = dense_message[nlist_mask.reshape(-1)]
+    compact_reduced = aggregate(
+        compact_message,
+        compact_edge[0],
+        average=False,
+        num_owner=2,
+    )
+    static_reduced = aggregate(
+        dense_message,
+        static_edge[0],
+        average=False,
+        num_owner=2,
+    )
+    torch.testing.assert_close(static_reduced, compact_reduced)
+
+    pair_mask = (
+        a_mask[:, :, :, None] & a_mask[:, :, None, :]
+    ).reshape(-1)
+    dense_angle_message = torch.arange(
+        1, 9, dtype=torch.float32, device=_CPU
+    ).reshape(-1, 1)
+    dense_angle_message = dense_angle_message * pair_mask.reshape(-1, 1)
+    compact_angle_reduced = aggregate(
+        dense_angle_message[pair_mask],
+        compact_angle[1],
+        average=False,
+        num_owner=compact_edge.shape[1],
+    )
+    static_angle_reduced = aggregate(
+        dense_angle_message,
+        static_angle[1],
+        average=False,
+        num_owner=static_edge.shape[1],
+    )
+    torch.testing.assert_close(
+        static_angle_reduced[nlist_mask.reshape(-1)],
+        compact_angle_reduced,
+    )
 
 
 def test_replay_mock_reuses_static_input_and_output_addresses() -> None:

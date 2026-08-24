@@ -9,6 +9,8 @@ neighbor-list work are deliberately outside the graph.
 
 from __future__ import annotations
 
+import copy
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -49,6 +51,85 @@ class CUDAGraphInputError(RuntimeError):
 
 class CUDAGraphValidationError(RuntimeError):
     """Raised when replay stability or eager/replay parity validation fails."""
+
+
+def _resolve_fixed_neighbor_slots(
+    requested: Any,
+    checkpoint_slots: int,
+    initial_max_neighbors: int,
+    *,
+    capacity_factor: float,
+    capacity_headroom: int,
+) -> int:
+    """Choose an adaptive fixed capacity or validate an explicit capacity."""
+    if capacity_factor < 1.0:
+        raise ValueError("neighbor_capacity_factor must be at least 1.0")
+    if capacity_headroom < 0:
+        raise ValueError("neighbor_capacity_headroom must be non-negative")
+    if initial_max_neighbors > checkpoint_slots:
+        raise ValueError(
+            "DPA3 checkpoint e_sel is smaller than the initial neighbor count: "
+            f"{checkpoint_slots} < {initial_max_neighbors}"
+        )
+    slots = (
+        min(
+            checkpoint_slots,
+            max(
+                1,
+                initial_max_neighbors + capacity_headroom,
+                math.ceil(initial_max_neighbors * capacity_factor),
+            ),
+        )
+        if requested is None
+        else int(requested)
+    )
+    if slots <= 0:
+        raise ValueError("DPA3 Opt2 fixed_neighbor_slots must be positive")
+    if slots < initial_max_neighbors:
+        raise ValueError(
+            "DPA3 Opt2 fixed_neighbor_slots is smaller than the initial "
+            f"neighbor count: {slots} < {initial_max_neighbors}"
+        )
+    if slots > checkpoint_slots:
+        raise ValueError(
+            "DPA3 Opt2 fixed_neighbor_slots exceeds checkpoint e_sel: "
+            f"{slots} > {checkpoint_slots}"
+        )
+    return slots
+
+
+def _rehydrate_static_dynamic_model(
+    scripted_model: Any,
+    model_params: dict[str, Any],
+    device: torch.device,
+) -> Any:
+    """Rebuild the frozen DPA3 as eager PT with fixed padded dynamic selection."""
+    from deepmd.pt.model.model import get_model
+
+    with torch.device(device):
+        model = get_model(copy.deepcopy(model_params)).to(device)
+    incompatible = model.load_state_dict(scripted_model.state_dict(), strict=False)
+    if incompatible.missing_keys or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "DPA3 Opt2 could not strictly rehydrate the released checkpoint: "
+            f"missing={incompatible.missing_keys}, "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
+    try:
+        repflows = model.atomic_model.descriptor.repflows
+    except AttributeError as exc:
+        raise RuntimeError(
+            "DPA3 Opt2 rehydrated model does not expose descriptor.repflows"
+        ) from exc
+    if not repflows.use_dynamic_sel:
+        raise ValueError(
+            "DPA3 Opt2 fixed padded path requires a dynamic-selection checkpoint"
+        )
+    repflows._use_static_dynamic_sel = True
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    return model
 
 
 def _copy_fixed_tensor_(name: str, destination: Tensor, source: Tensor) -> None:
@@ -431,6 +512,7 @@ class DPA3ModelCUDAGraphEvaluator:
         self,
         eager_evaluator: DPA3EnergyForceEvaluator,
         *,
+        fixed_neighbor_slots: int,
         capture_warmup: int = 3,
         energy_atol: float = 1.0e-6,
         force_atol: float = 1.0e-6,
@@ -459,9 +541,35 @@ class DPA3ModelCUDAGraphEvaluator:
         self.virial_atol = float(virial_atol)
 
         self._backend = eager_evaluator._backend
-        self._inner = self._backend.dp.model["Default"]
-        self.jit_capture_rewrite_stats = (
-            _patch_released_dpa3_jit_for_capture_(self._inner)
+        self._archive_inner = self._backend.dp.model["Default"]
+        checkpoint_slots = int(sum(self._archive_inner.get_sel()))
+        initial_max = eager_evaluator.neighbor_shape_metadata.get(
+            "initial_max_neighbors"
+        )
+        if initial_max is None:
+            raise RuntimeError(
+                "DPA3 Opt2 neighbor preflight did not report initial_max_neighbors"
+            )
+        self.fixed_neighbor_slots = _resolve_fixed_neighbor_slots(
+            fixed_neighbor_slots,
+            checkpoint_slots,
+            int(initial_max),
+            capacity_factor=1.0,
+            capacity_headroom=0,
+        )
+        self.checkpoint_neighbor_slots = checkpoint_slots
+        self.initial_max_neighbors = int(initial_max)
+        self._inner = _rehydrate_static_dynamic_model(
+            self._archive_inner,
+            self._backend.get_model_def_script(),
+            self.device,
+        )
+        self.jit_capture_rewrite_stats = JITCaptureRewriteStats(
+            methods_scanned=0,
+            scalar_zeros=0,
+            index_put_zeros=0,
+            tensor_conditionals=0,
+            caches_flushed=0,
         )
         if self._backend._uses_edge_schema:
             raise NotImplementedError(
@@ -479,6 +587,9 @@ class DPA3ModelCUDAGraphEvaluator:
         self.validation_energy_abs_error = 0.0
         self.validation_force_max_abs_error = 0.0
         self.validation_virial_max_abs_error = 0.0
+        self.compact_parity_energy_abs_error = 0.0
+        self.compact_parity_force_max_abs_error = 0.0
+        self.compact_parity_virial_max_abs_error = 0.0
         self.replay_output_addresses_stable = False
         self.static_input_addresses_stable = False
         self.validation_passed = False
@@ -509,7 +620,7 @@ class DPA3ModelCUDAGraphEvaluator:
                 self.eager_evaluator.atom_types,
                 self.eager_evaluator.cell,
                 self._backend.rcut,
-                list(self._inner.get_sel()),
+                [self.fixed_neighbor_slots],
             )
         )
         if mapping is None:
@@ -575,6 +686,10 @@ class DPA3ModelCUDAGraphEvaluator:
         """Warm and capture exactly one static-shape model/autograd graph."""
         if self.captured:
             raise RuntimeError("DPA3 model CUDA Graph has already been captured")
+        # Scientific reference remains the original released compact model.
+        compact_reference = tuple(
+            value.clone() for value in self.eager_evaluator(positions)
+        )
         dynamic_inputs = self._build_neighbor_inputs(positions)
         self.static_inputs = StaticLowerInputs.from_dynamic(*dynamic_inputs)
         self._initial_input_addresses = self.static_inputs.addresses()
@@ -591,6 +706,24 @@ class DPA3ModelCUDAGraphEvaluator:
             reference = tuple(value.clone() for value in reference)
         current_stream.wait_stream(side_stream)
         torch.cuda.synchronize(self.device)
+        assert reference is not None
+        candidate_reference_errors = tuple(
+            _maximum_abs_error(new, old)
+            for new, old in zip(reference, compact_reference, strict=True)
+        )
+        self.compact_parity_force_max_abs_error = candidate_reference_errors[0]
+        self.compact_parity_energy_abs_error = candidate_reference_errors[1]
+        self.compact_parity_virial_max_abs_error = candidate_reference_errors[2]
+        for name, error, tolerance in (
+            ("force", candidate_reference_errors[0], self.force_atol),
+            ("energy", candidate_reference_errors[1], self.energy_atol),
+            ("virial", candidate_reference_errors[2], self.virial_atol),
+        ):
+            if error > tolerance:
+                raise CUDAGraphValidationError(
+                    "DPA3 fixed-slot padded-dynamic parity failed before capture: "
+                    f"{name} error {error:.6g} > {tolerance:.6g}"
+                )
 
         capture_started = time.perf_counter()
         graph = torch.cuda.CUDAGraph()
@@ -732,7 +865,20 @@ class DPA3ModelCUDAGraphEvaluator:
             "validation_virial_max_abs_error": (
                 self.validation_virial_max_abs_error
             ),
+            "compact_parity_energy_abs_error": (
+                self.compact_parity_energy_abs_error
+            ),
+            "compact_parity_force_max_abs_error": (
+                self.compact_parity_force_max_abs_error
+            ),
+            "compact_parity_virial_max_abs_error": (
+                self.compact_parity_virial_max_abs_error
+            ),
             "capacity_overflow_policy": "device-assert-and-fail-no-fallback",
+            "dynamic_selection_layout": "fixed-slot-padded",
+            "fixed_neighbor_slots": self.fixed_neighbor_slots,
+            "checkpoint_neighbor_slots": self.checkpoint_neighbor_slots,
+            "initial_max_neighbors": self.initial_max_neighbors,
             "jit_capture_rewrites": self.jit_capture_rewrite_stats.as_dict(),
         }
 
@@ -784,24 +930,63 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         device=device,
         prefix="opt2",
     )
+    capacity_factor = float(request.options.get("neighbor_capacity_factor", 1.25))
+    capacity_headroom = int(request.options.get("neighbor_capacity_headroom", 16))
+    requested_slots = request.options.get("fixed_neighbor_slots")
     configured_capacity = request.options.get("neighbor_search_capacity")
+    if requested_slots is not None and configured_capacity is not None and (
+        int(requested_slots) != int(configured_capacity)
+    ):
+        raise ValueError(
+            "DPA3 Opt2 fixed_neighbor_slots and neighbor_search_capacity "
+            f"disagree: {requested_slots} != {configured_capacity}"
+        )
+    if requested_slots is None:
+        requested_slots = configured_capacity
     eager_evaluator = DPA3EnergyForceEvaluator(
         atoms,
         request.model_path,
         device=device,
-        neighbor_capacity_factor=float(
-            request.options.get("neighbor_capacity_factor", 1.25)
-        ),
-        neighbor_capacity_headroom=int(
-            request.options.get("neighbor_capacity_headroom", 16)
-        ),
-        neighbor_search_capacity=(
-            None if configured_capacity is None else int(configured_capacity)
-        ),
+        neighbor_capacity_factor=capacity_factor,
+        neighbor_capacity_headroom=capacity_headroom,
+        neighbor_search_capacity=None,
         profiler=profiler,
+    )
+    initial_max_neighbors = int(
+        eager_evaluator.neighbor_shape_metadata["initial_max_neighbors"]
+    )
+    checkpoint_slots = int(
+        sum(eager_evaluator._backend.dp.model["Default"].get_sel())
+    )
+    fixed_neighbor_slots = _resolve_fixed_neighbor_slots(
+        requested_slots,
+        checkpoint_slots,
+        initial_max_neighbors,
+        capacity_factor=capacity_factor,
+        capacity_headroom=capacity_headroom,
+    )
+    # The initial preflight used the checkpoint selection to discover the true
+    # maximum safely. Narrow the fixed raw-search capacity for all subsequent
+    # calls; nv_search_matrix_fixed retains its device-side overflow assert.
+    eager_evaluator._backend._nlist_builder.fixed_search_capacity = (
+        fixed_neighbor_slots
+    )
+    eager_evaluator.neighbor_shape_metadata = (
+        eager_evaluator._backend._nlist_builder.fixed_shape_metadata()
+    )
+    eager_evaluator.neighbor_shape_metadata.update(
+        {
+            "capacity_policy": (
+                "adaptive-initial-preflight"
+                if requested_slots is None
+                else "explicit"
+            ),
+            "checkpoint_neighbor_slots": checkpoint_slots,
+        }
     )
     evaluator = DPA3ModelCUDAGraphEvaluator(
         eager_evaluator,
+        fixed_neighbor_slots=fixed_neighbor_slots,
         capture_warmup=int(
             request.options.get(
                 "cuda_graph_capture_warmup",

@@ -77,6 +77,51 @@ if not hasattr(torch.ops.deepmd, "border_op"):
     torch.ops.deepmd.border_op = border_op
 
 
+@torch.jit.script
+def _get_static_graph_index(
+    nlist: torch.Tensor,
+    a_nlist_mask: torch.Tensor,
+    nall: int,
+    use_loc_mapping: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build fixed-capacity indices for dynamic-selection message passing.
+
+    Padded slots stay in the flattened edge/angle arrays. Their switch weights
+    are zero, so reductions equal compact dynamic selection while all tensor
+    shapes remain static for CUDA Graph capture.
+    """
+    nf, nloc, nnei = nlist.shape
+    a_nnei = a_nlist_mask.shape[2]
+    device = nlist.device
+    local_index = torch.arange(nf * nloc, dtype=nlist.dtype, device=device)
+    n2e_index = (
+        local_index.reshape(nf, nloc, 1)
+        .expand(nf, nloc, nnei)
+        .reshape(-1)
+    )
+    frame_stride = nloc if use_loc_mapping else nall
+    frame_shift = torch.arange(nf, dtype=nlist.dtype, device=device) * frame_stride
+    n_ext2e_index = (nlist + frame_shift[:, None, None]).reshape(-1)
+    n2a_index = (
+        local_index.reshape(nf, nloc, 1, 1)
+        .expand(nf, nloc, a_nnei, a_nnei)
+        .reshape(-1)
+    )
+    edge_id = torch.arange(
+        nf * nloc * nnei, dtype=nlist.dtype, device=device
+    ).reshape(nf, nloc, nnei)[:, :, :a_nnei]
+    eij2a_index = (
+        edge_id.unsqueeze(-1).expand(nf, nloc, a_nnei, a_nnei).reshape(-1)
+    )
+    eik2a_index = (
+        edge_id.unsqueeze(-2).expand(nf, nloc, a_nnei, a_nnei).reshape(-1)
+    )
+    return (
+        torch.stack([n2e_index, n_ext2e_index], dim=0),
+        torch.stack([n2a_index, eij2a_index, eik2a_index], dim=0),
+    )
+
+
 @DescriptorBlock.register("se_repflow")
 class DescrptBlockRepflows(DescriptorBlock):
     r"""
@@ -189,6 +234,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         Whether this block is trainable
     """
 
+    _use_static_dynamic_sel: bool = False
+
     def __init__(
         self,
         e_rcut: float,
@@ -261,6 +308,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.edge_init_use_dist = edge_init_use_dist
         self.use_exp_switch = use_exp_switch
         self.use_dynamic_sel = use_dynamic_sel
+        self._use_static_dynamic_sel = type(self)._use_static_dynamic_sel
         self.sel_reduce_factor = sel_reduce_factor
         self.sequential_update = sequential_update
         if self.use_dynamic_sel and not self.smooth_edge_update:
@@ -466,8 +514,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             extended_coord,
             nlist,
             atype,
-            self.mean,
-            self.stddev,
+            self.mean[:, :nnei],
+            self.stddev[:, :nnei],
             self.e_rcut,
             self.e_rcut_smth,
             protection=self.env_protection,
@@ -482,12 +530,13 @@ class DescrptBlockRepflows(DescriptorBlock):
         a_dist_mask = (safe_for_norm(diff, dim=-1) < self.a_rcut)[:, :, : self.a_sel]
         a_nlist = nlist[:, :, : self.a_sel]
         a_nlist = torch.where(a_dist_mask, a_nlist, -1)
+        a_nnei = a_nlist.shape[2]
         _, a_diff, a_sw = prod_env_mat(
             extended_coord,
             a_nlist,
             atype,
-            self.mean[:, : self.a_sel],
-            self.stddev[:, : self.a_sel],
+            self.mean[:, :a_nnei],
+            self.stddev[:, :a_nnei],
             self.a_rcut,
             self.a_rcut_smth,
             protection=self.env_protection,
@@ -539,26 +588,43 @@ class DescrptBlockRepflows(DescriptorBlock):
             ).reshape(nlist.shape)
         if self.use_dynamic_sel:
             # get graph index
-            edge_index, angle_index = get_graph_index(
-                nlist,
-                nlist_mask,
-                a_nlist_mask,
-                nall,
-                use_loc_mapping=self.use_loc_mapping,
-            )
-            # flat all the tensors
-            # n_edge x 1
-            edge_input = edge_input[nlist_mask]
-            # n_edge x 3
-            h2 = h2[nlist_mask]
-            # n_edge x 1
-            sw = sw[nlist_mask]
+            if self._use_static_dynamic_sel:
+                edge_index, angle_index = _get_static_graph_index(
+                    nlist,
+                    a_nlist_mask,
+                    nall,
+                    use_loc_mapping=self.use_loc_mapping,
+                )
+                edge_input = edge_input.reshape(-1, edge_input.shape[-1])
+                h2 = h2.reshape(-1, h2.shape[-1])
+                sw = sw.reshape(-1)
+            else:
+                edge_index, angle_index = get_graph_index(
+                    nlist,
+                    nlist_mask,
+                    a_nlist_mask,
+                    nall,
+                    use_loc_mapping=self.use_loc_mapping,
+                )
+                # flat all the tensors
+                # n_edge x 1
+                edge_input = edge_input[nlist_mask]
+                # n_edge x 3
+                h2 = h2[nlist_mask]
+                # n_edge x 1
+                sw = sw[nlist_mask]
             # nb x nloc x a_nnei x a_nnei
             a_nlist_mask = a_nlist_mask[:, :, :, None] & a_nlist_mask[:, :, None, :]
-            # n_angle x 1
-            angle_input = angle_input[a_nlist_mask]
-            # n_angle x 1
-            a_sw = (a_sw[:, :, :, None] * a_sw[:, :, None, :])[a_nlist_mask]
+            if self._use_static_dynamic_sel:
+                angle_input = angle_input.reshape(-1, angle_input.shape[-1])
+                a_sw = (
+                    a_sw[:, :, :, None] * a_sw[:, :, None, :]
+                ).reshape(-1)
+            else:
+                # n_angle x 1
+                angle_input = angle_input[a_nlist_mask]
+                # n_angle x 1
+                a_sw = (a_sw[:, :, :, None] * a_sw[:, :, None, :])[a_nlist_mask]
         else:
             # avoid jit assertion
             edge_index = torch.zeros([2, 1], device=nlist.device, dtype=nlist.dtype)
