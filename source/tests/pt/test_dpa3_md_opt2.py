@@ -108,10 +108,10 @@ def test_rewrite_capture_unsafe_boolean_index_put_uses_masked_fill() -> None:
     function._debug_flush_compilation_cache()
     assert not any(node.kind() == "aten::index_put_" for node in function.graph.nodes())
     assert any(node.kind() == "aten::masked_fill_" for node in function.graph.nodes())
-    values = torch.tensor([-1, 4, -1], dtype=torch.int64)
+    values = torch.tensor([-1, 4, -1], dtype=torch.int64, device=_CPU)
     torch.testing.assert_close(
         function(values),
-        torch.tensor([0, 4, 0], dtype=torch.int64),
+        torch.tensor([0, 4, 0], dtype=torch.int64, device=_CPU),
     )
 
 

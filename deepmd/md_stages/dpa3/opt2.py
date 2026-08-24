@@ -198,7 +198,6 @@ def _rewrite_capture_unsafe_index_put_zeros_(graph: Any) -> int:
     and ``accumulate=False``; ``masked_fill_`` has identical semantics without
     the capture-unsafe dynamic indexing machinery.
     """
-
     replacements = 0
     for node in list(_iter_jit_nodes(graph)):
         if node.kind() != "aten::index_put_":
