@@ -13,6 +13,9 @@ from deepmd.md_stages.dpa3 import opt2
 from md_benchmark.md_route import MDConfig, MDRunRequest
 
 
+_CPU = torch.device("cpu")
+
+
 def _atoms() -> Atoms:
     return Atoms(
         "H2",
@@ -35,10 +38,10 @@ def _request(*, backend: str = "model-only-cuda-graph") -> MDRunRequest:
 
 def test_static_lower_inputs_reuse_addresses_and_copy_values() -> None:
     dynamic = (
-        torch.randn(1, 6, 3),
-        torch.arange(6).reshape(1, 6),
-        torch.arange(8).reshape(1, 2, 4),
-        torch.arange(6).reshape(1, 6),
+        torch.randn(1, 6, 3, device=_CPU),
+        torch.arange(6, device=_CPU).reshape(1, 6),
+        torch.arange(8, device=_CPU).reshape(1, 2, 4),
+        torch.arange(6, device=_CPU).reshape(1, 6),
     )
     static = opt2.StaticLowerInputs.from_dynamic(*dynamic)
     addresses = static.addresses()
@@ -50,23 +53,24 @@ def test_static_lower_inputs_reuse_addresses_and_copy_values() -> None:
     for name, expected in zip(
         ("extended_coord", "extended_atype", "nlist", "mapping"),
         replacements,
+        strict=True,
     ):
         torch.testing.assert_close(getattr(static, name), expected)
 
 
 def test_static_lower_inputs_reject_shape_change() -> None:
     dynamic = (
-        torch.randn(1, 6, 3),
-        torch.arange(6).reshape(1, 6),
-        torch.arange(8).reshape(1, 2, 4),
-        torch.arange(6).reshape(1, 6),
+        torch.randn(1, 6, 3, device=_CPU),
+        torch.arange(6, device=_CPU).reshape(1, 6),
+        torch.arange(8, device=_CPU).reshape(1, 2, 4),
+        torch.arange(6, device=_CPU).reshape(1, 6),
     )
     static = opt2.StaticLowerInputs.from_dynamic(*dynamic)
     with pytest.raises(opt2.CUDAGraphInputError, match="nlist shape changed"):
         static.copy_from_(
             dynamic[0],
             dynamic[1],
-            torch.arange(10).reshape(1, 2, 5),
+            torch.arange(10, device=_CPU).reshape(1, 2, 5),
             dynamic[3],
         )
 
@@ -82,27 +86,30 @@ def test_rewrite_capture_unsafe_scalar_zero_uses_device_allocation() -> None:
 
     assert opt2._rewrite_capture_unsafe_scalar_zeros_(function.graph) == 1
     assert not any(node.kind() == "aten::tensor" for node in function.graph.nodes())
-    actual = function(torch.ones(3, dtype=torch.int64))
-    torch.testing.assert_close(actual, torch.zeros((), dtype=torch.int64))
+    actual = function(torch.ones(3, dtype=torch.int64, device=_CPU))
+    torch.testing.assert_close(
+        actual,
+        torch.zeros((), dtype=torch.int64, device=_CPU),
+    )
 
 
 def test_replay_mock_reuses_static_input_and_output_addresses() -> None:
     dynamic = (
-        torch.randn(1, 6, 3),
-        torch.arange(6).reshape(1, 6),
-        torch.arange(8).reshape(1, 2, 4),
-        torch.arange(6).reshape(1, 6),
+        torch.randn(1, 6, 3, device=_CPU),
+        torch.arange(6, device=_CPU).reshape(1, 6),
+        torch.arange(8, device=_CPU).reshape(1, 2, 4),
+        torch.arange(6, device=_CPU).reshape(1, 6),
     )
     evaluator = object.__new__(opt2.DPA3ModelCUDAGraphEvaluator)
     evaluator.captured = True
     evaluator.static_inputs = opt2.StaticLowerInputs.from_dynamic(*dynamic)
     evaluator._initial_input_addresses = evaluator.static_inputs.addresses()
-    evaluator.static_force = torch.tensor([[1.0, 2.0, 3.0]])
-    evaluator.static_energy = torch.tensor(4.0)
-    evaluator.static_virial = torch.eye(3)
+    evaluator.static_force = torch.tensor([[1.0, 2.0, 3.0]], device=_CPU)
+    evaluator.static_energy = torch.tensor(4.0, device=_CPU)
+    evaluator.static_virial = torch.eye(3, device=_CPU)
     evaluator.production_replays = 0
     evaluator.profiler = opt2.CudaPhaseProfiler(
-        enabled=False, device=torch.device("cpu")
+        enabled=False, device=_CPU
     )
     evaluator._build_neighbor_inputs = lambda _positions: tuple(
         value + 1 for value in dynamic
@@ -118,15 +125,18 @@ def test_replay_mock_reuses_static_input_and_output_addresses() -> None:
     input_addresses = evaluator.static_inputs.addresses()
     output_addresses = evaluator.output_addresses()
 
-    force, energy, virial = evaluator(torch.zeros(2, 3))
+    force, energy, virial = evaluator(torch.zeros(2, 3, device=_CPU))
 
     assert evaluator.graph.calls == 1
     assert evaluator.production_replays == 1
     assert evaluator.static_inputs.addresses() == input_addresses
     assert evaluator.output_addresses() == output_addresses
-    torch.testing.assert_close(force, torch.tensor([[1.0, 2.0, 3.0]]))
-    torch.testing.assert_close(energy, torch.tensor(4.0))
-    torch.testing.assert_close(virial, torch.eye(3))
+    torch.testing.assert_close(
+        force,
+        torch.tensor([[1.0, 2.0, 3.0]], device=_CPU),
+    )
+    torch.testing.assert_close(energy, torch.tensor(4.0, device=_CPU))
+    torch.testing.assert_close(virial, torch.eye(3, device=_CPU))
 
 
 def test_route_rejects_wrong_backend_before_cuda() -> None:

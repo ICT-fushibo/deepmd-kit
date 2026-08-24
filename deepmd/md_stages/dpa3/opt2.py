@@ -10,14 +10,15 @@ neighbor-list work are deliberately outside the graph.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
+import torch  # noqa: TID253
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
-from torch import Tensor
+from torch import Tensor  # noqa: TID253
 
 from deepmd.md_stages.dpa3.opt1 import (
     _DEEPMD_OPT1_ENV,
@@ -84,7 +85,7 @@ class StaticLowerInputs:
         extended_atype: Tensor,
         nlist: Tensor,
         mapping: Tensor,
-    ) -> "StaticLowerInputs":
+    ) -> StaticLowerInputs:
         return cls(
             extended_coord=extended_coord.detach().clone(),
             extended_atype=extended_atype.detach().clone(),
@@ -128,16 +129,15 @@ def _maximum_abs_error(candidate: Tensor, reference: Tensor) -> float:
     return float((candidate - reference).abs().max().item())
 
 
-def _iter_jit_nodes(block):
+def _iter_jit_nodes(block: Any) -> Iterator[Any]:
     """Yield TorchScript nodes recursively, including nodes in control flow."""
-
     for node in block.nodes():
         yield node
         for nested in node.blocks():
             yield from _iter_jit_nodes(nested)
 
 
-def _rewrite_capture_unsafe_scalar_zeros_(graph) -> int:
+def _rewrite_capture_unsafe_scalar_zeros_(graph: Any) -> int:
     """Replace ``torch.tensor(0, device=cuda)`` with a device-side scalar zero.
 
     The released DPA3 TorchScript archive predates the source-level
@@ -146,7 +146,6 @@ def _rewrite_capture_unsafe_scalar_zeros_(graph) -> int:
     ``torch.zeros((), dtype=..., device=...)`` is mathematically identical and
     is allocated directly from the CUDA graph pool.
     """
-
     replacements = 0
     for node in list(_iter_jit_nodes(graph)):
         if node.kind() != "aten::tensor":
@@ -189,7 +188,6 @@ def _rewrite_capture_unsafe_scalar_zeros_(graph) -> int:
 
 def _patch_released_dpa3_jit_for_capture_(model: Any) -> int:
     """Patch only Repflows TorchScript methods and flush their execution plans."""
-
     replacements = 0
     for module_name, module in model.named_modules():
         module_type = type(module).__name__
@@ -418,10 +416,12 @@ class DPA3ModelCUDAGraphEvaluator:
             )
 
         replay_errors = tuple(
-            _maximum_abs_error(new, old) for new, old in zip(second, first)
+            _maximum_abs_error(new, old)
+            for new, old in zip(second, first, strict=True)
         )
         reference_errors = tuple(
-            _maximum_abs_error(new, old) for new, old in zip(second, reference)
+            _maximum_abs_error(new, old)
+            for new, old in zip(second, reference, strict=True)
         )
         self.validation_force_max_abs_error = max(
             replay_errors[0], reference_errors[0]

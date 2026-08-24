@@ -16,6 +16,9 @@ from deepmd.md_stages.dpa4 import opt2
 from md_benchmark.md_route import MDConfig, MDRunRequest
 
 
+_CPU = torch.device("cpu")
+
+
 def _atoms() -> Atoms:
     return Atoms(
         "Cu2",
@@ -27,14 +30,16 @@ def _atoms() -> Atoms:
 
 def _schema(edge_count: int) -> EdgeNeighborList:
     return EdgeNeighborList(
-        coord=torch.arange(6, dtype=torch.float64).reshape(1, 2, 3),
-        atype=torch.zeros((1, 2), dtype=torch.long),
-        edge_index=torch.zeros((2, edge_count), dtype=torch.long),
+        coord=torch.arange(6, dtype=torch.float64, device=_CPU).reshape(1, 2, 3),
+        atype=torch.zeros((1, 2), dtype=torch.long, device=_CPU),
+        edge_index=torch.zeros((2, edge_count), dtype=torch.long, device=_CPU),
         edge_vec=torch.arange(
-            edge_count * 3, dtype=torch.float64
+            edge_count * 3, dtype=torch.float64, device=_CPU
         ).reshape(edge_count, 3),
-        edge_scatter_index=torch.zeros((2, edge_count), dtype=torch.long),
-        edge_mask=torch.ones(edge_count, dtype=torch.bool),
+        edge_scatter_index=torch.zeros(
+            (2, edge_count), dtype=torch.long, device=_CPU
+        ),
+        edge_mask=torch.ones(edge_count, dtype=torch.bool, device=_CPU),
     )
 
 
@@ -65,7 +70,7 @@ def test_route_accepts_canonical_and_compatibility_backend_until_cuda(
         config=MDConfig(steps=1, observation_steps=(1,), dtype="float64"),
         backend=backend,
     )
-    with pytest.raises(RuntimeError, match="requires config.device"):
+    with pytest.raises(RuntimeError, match=r"requires config\.device"):
         opt2.run_md(request)
 
 
@@ -197,15 +202,19 @@ def test_hot_path_builds_and_copies_edges_before_graph_replay(monkeypatch) -> No
             return 4
 
     evaluator = object.__new__(opt2.DPA4ModelOnlyGraphEvaluator)
-    evaluator.device = torch.device("cpu")
+    evaluator.device = _CPU
     evaluator.model_dtype = torch.float64
-    evaluator.atom_types = torch.zeros((1, 2), dtype=torch.long)
+    evaluator.atom_types = torch.zeros((1, 2), dtype=torch.long, device=_CPU)
     evaluator.profiler = FakeProfiler()
     evaluator._static = FakeStatic()
     evaluator._input_addresses = evaluator._static.addresses()
-    evaluator._captured_force = torch.ones((2, 3), dtype=torch.float64)
-    evaluator._captured_energy = torch.tensor(-1.25, dtype=torch.float64)
-    evaluator._captured_virial = torch.eye(3, dtype=torch.float64)
+    evaluator._captured_force = torch.ones(
+        (2, 3), dtype=torch.float64, device=_CPU
+    )
+    evaluator._captured_energy = torch.tensor(
+        -1.25, dtype=torch.float64, device=_CPU
+    )
+    evaluator._captured_virial = torch.eye(3, dtype=torch.float64, device=_CPU)
     evaluator._output_addresses = tuple(
         value.data_ptr()
         for value in (
@@ -221,7 +230,7 @@ def test_hot_path_builds_and_copies_edges_before_graph_replay(monkeypatch) -> No
     monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
 
     force, energy, virial = evaluator(
-        torch.zeros((2, 3), dtype=torch.float64)
+        torch.zeros((2, 3), dtype=torch.float64, device=_CPU)
     )
 
     assert events == ["build", "copy", "replay"]

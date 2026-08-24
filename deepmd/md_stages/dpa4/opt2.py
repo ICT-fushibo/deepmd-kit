@@ -16,13 +16,15 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import torch
+import torch  # noqa: TID253
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
-from torch import Tensor
+from torch import Tensor  # noqa: TID253
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 from deepmd.dpmodel.utils.neighbor_list import EdgeNeighborList
 from deepmd.md_stages.dpa3.opt1 import (
@@ -93,7 +95,7 @@ class _StaticEdgeGraphInputs:
         cls,
         schema: EdgeNeighborList,
         capacity: int,
-    ) -> "_StaticEdgeGraphInputs":
+    ) -> _StaticEdgeGraphInputs:
         if capacity < schema.edge_vec.shape[0]:
             raise ValueError(
                 f"edge capacity {capacity} < initial edges {schema.edge_vec.shape[0]}"
@@ -376,21 +378,34 @@ class DPA4ModelOnlyGraphEvaluator(DPA4EnergyForceEvaluator):
 
             replay_errors = tuple(
                 float((second - first).abs().max().item())
-                for first, second in zip(first_replay, second_replay)
+                for first, second in zip(
+                    first_replay,
+                    second_replay,
+                    strict=True,
+                )
             )
             fixed_eager_errors = tuple(
                 float((replay - eager).abs().max().item())
-                for replay, eager in zip(second_replay, fixed_eager_reference)
+                for replay, eager in zip(
+                    second_replay,
+                    fixed_eager_reference,
+                    strict=True,
+                )
             )
             ragged_eager_errors = tuple(
                 float((replay - eager).abs().max().item())
-                for replay, eager in zip(second_replay, ragged_eager_reference)
+                for replay, eager in zip(
+                    second_replay,
+                    ragged_eager_reference,
+                    strict=True,
+                )
             )
             validation_errors = tuple(
                 max(fixed_error, ragged_error)
                 for fixed_error, ragged_error in zip(
                     fixed_eager_errors,
                     ragged_eager_errors,
+                    strict=True,
                 )
             )
             (
