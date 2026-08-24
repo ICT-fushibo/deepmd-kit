@@ -224,6 +224,7 @@ def test_hot_path_builds_and_copies_edges_before_graph_replay(monkeypatch) -> No
         )
     )
     evaluator._graph = SimpleNamespace(replay=lambda: events.append("replay"))
+    evaluator.production_replays = 0
     evaluator._build_edge_schema = lambda _positions: (
         events.append("build") or _schema(4)
     )
@@ -234,6 +235,7 @@ def test_hot_path_builds_and_copies_edges_before_graph_replay(monkeypatch) -> No
     )
 
     assert events == ["build", "copy", "replay"]
+    assert evaluator.production_replays == 1
     torch.testing.assert_close(force, evaluator._captured_force)
     torch.testing.assert_close(energy, evaluator._captured_energy)
     torch.testing.assert_close(virial, evaluator._captured_virial)

@@ -10,15 +10,17 @@ neighbor-list work are deliberately outside the graph.
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch  # noqa: TID253
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 from torch import Tensor  # noqa: TID253
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 from deepmd.md_stages.dpa3.opt1 import (
     _DEEPMD_OPT1_ENV,
