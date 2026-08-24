@@ -243,9 +243,12 @@ def _rewrite_capture_unsafe_tensor_conditionals_(graph: Any) -> int:
     condition as a Python bool performs a capture-forbidden device sync.
     """
     replacements = 0
-    for node in list(_iter_jit_nodes(graph)):
-        if node.kind() != "prim::If":
-            continue
+    # Filter before mutating the graph: destroying an If also invalidates all
+    # of its block nodes.  Innermost-first order keeps nested candidates valid.
+    candidates = [
+        node for node in _iter_jit_nodes(graph) if node.kind() == "prim::If"
+    ]
+    for node in reversed(candidates):
         inputs = list(node.inputs())
         blocks = list(node.blocks())
         if len(inputs) != 1 or len(blocks) != 2:
