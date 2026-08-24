@@ -131,6 +131,33 @@ def _maximum_abs_error(candidate: Tensor, reference: Tensor) -> float:
     return float((candidate - reference).abs().max().item())
 
 
+@dataclass(frozen=True)
+class JITCaptureRewriteStats:
+    """Auditable counts for the released-checkpoint TorchScript rewrite."""
+
+    methods_scanned: int
+    scalar_zeros: int
+    index_put_zeros: int
+    tensor_conditionals: int
+    caches_flushed: int
+
+    @property
+    def total(self) -> int:
+        """Return the total number of graph nodes replaced."""
+        return self.scalar_zeros + self.index_put_zeros + self.tensor_conditionals
+
+    def as_dict(self) -> dict[str, int]:
+        """Return JSON-serializable rewrite diagnostics."""
+        return {
+            "methods_scanned": self.methods_scanned,
+            "scalar_zeros": self.scalar_zeros,
+            "index_put_zeros": self.index_put_zeros,
+            "tensor_conditionals": self.tensor_conditionals,
+            "total": self.total,
+            "caches_flushed": self.caches_flushed,
+        }
+
+
 def _iter_jit_nodes(block: Any) -> Iterator[Any]:
     """Yield TorchScript nodes recursively, including nodes in control flow."""
     for node in block.nodes():
@@ -212,7 +239,27 @@ def _rewrite_capture_unsafe_index_put_zeros_(graph: Any) -> int:
         if len(masks) != 1:
             continue
         value_node = inputs[2].node()
-        if value_node.kind() not in {"aten::tensor", "aten::zeros"}:
+        if value_node.kind() == "aten::tensor":
+            value_inputs = list(value_node.inputs())
+            scalar = value_inputs[0].toIValue() if value_inputs else None
+            if not isinstance(scalar, (bool, int, float, complex)) or scalar != 0:
+                continue
+        elif value_node.kind() == "aten::zeros":
+            value_inputs = list(value_node.inputs())
+            if not value_inputs:
+                continue
+            shape = value_inputs[0]
+            shape_node = shape.node()
+            is_scalar_shape = (
+                shape_node.kind() == "prim::ListConstruct"
+                and not list(shape_node.inputs())
+            )
+            if not is_scalar_shape:
+                shape_value = shape.toIValue()
+                is_scalar_shape = isinstance(shape_value, (list, tuple)) and not shape_value
+            if not is_scalar_shape:
+                continue
+        else:
             continue
 
         zero = graph.insertConstant(0)
@@ -234,6 +281,31 @@ def _rewrite_capture_unsafe_index_put_zeros_(graph: Any) -> int:
     return replacements
 
 
+def _is_capture_unsafe_tensor_conditional(node: Any) -> bool:
+    """Return whether an If converts a CUDA ``any`` tensor to a host bool."""
+    if node.kind() != "prim::If":
+        return False
+    inputs = list(node.inputs())
+    if len(inputs) != 1:
+        return False
+    bool_node = inputs[0].node()
+    if bool_node.kind() != "aten::Bool":
+        return False
+    bool_inputs = list(bool_node.inputs())
+    return (
+        len(bool_inputs) == 1
+        and bool_inputs[0].node().kind() == "aten::any"
+    )
+
+
+def _count_capture_unsafe_tensor_conditionals(graph: Any) -> int:
+    """Count CUDA-syncing tensor conditionals, including nested blocks."""
+    return sum(
+        _is_capture_unsafe_tensor_conditional(node)
+        for node in _iter_jit_nodes(graph)
+    )
+
+
 def _rewrite_capture_unsafe_tensor_conditionals_(graph: Any) -> int:
     """Inline custom-activation branches guarded by ``bool(torch.any(...))``.
 
@@ -246,7 +318,9 @@ def _rewrite_capture_unsafe_tensor_conditionals_(graph: Any) -> int:
     # Filter before mutating the graph: destroying an If also invalidates all
     # of its block nodes.  Innermost-first order keeps nested candidates valid.
     candidates = [
-        node for node in _iter_jit_nodes(graph) if node.kind() == "prim::If"
+        node
+        for node in _iter_jit_nodes(graph)
+        if _is_capture_unsafe_tensor_conditional(node)
     ]
     for node in reversed(candidates):
         inputs = list(node.inputs())
@@ -254,11 +328,6 @@ def _rewrite_capture_unsafe_tensor_conditionals_(graph: Any) -> int:
         if len(inputs) != 1 or len(blocks) != 2:
             continue
         bool_node = inputs[0].node()
-        if bool_node.kind() != "aten::Bool":
-            continue
-        bool_inputs = list(bool_node.inputs())
-        if len(bool_inputs) != 1 or bool_inputs[0].node().kind() != "aten::any":
-            continue
         if len(list(node.outputs())) != 1:
             continue
         then_block, else_block = blocks
@@ -294,41 +363,65 @@ def _rewrite_capture_unsafe_tensor_conditionals_(graph: Any) -> int:
     return replacements
 
 
-def _patch_released_dpa3_jit_for_capture_(model: Any) -> int:
-    """Patch only Repflows TorchScript methods and flush their execution plans."""
-    replacements = 0
-    for module_name, module in model.named_modules():
-        module_type = type(module).__name__
-        qualified_name = str(getattr(getattr(module, "_c", None), "qualified_name", ""))
-        module_label = f"{module_name} {module_type} {qualified_name}".lower()
-        normalized_label = module_label.replace("_", "")
-        is_repflow = "repflow" in module_label
-        is_custom_activation = (
-            "customsilu" in normalized_label or "customdsilu" in normalized_label
-        )
-        if not is_repflow and not is_custom_activation:
-            continue
+def _patch_released_dpa3_jit_for_capture_(model: Any) -> JITCaptureRewriteStats:
+    """Patch capture-unsafe operations in every released-model JIT method.
+
+    ``RecursiveScriptModule.named_modules()`` exposes loaded archive children as
+    generic wrappers on some PyTorch releases.  In particular, the released
+    DPA3 ``CustomSiLU`` child is not guaranteed to retain either its Python
+    class name or a ``custom_silu`` component in its qualified name.  Selecting
+    methods by those labels therefore left its ``bool(torch.any(mask))`` in the
+    executable graph even though the graph rewrite itself was correct.
+
+    All three rewrites below are selected by exact TorchScript operator and
+    input patterns and preserve semantics, so applying them to every scripted
+    method is both safer and more robust than relying on archive names.  Flush
+    *all* method execution plans after the mutation: a parent plan may already
+    contain an optimized ``prim::CallMethod`` path to the changed child.
+    """
+    scalar_zeros = 0
+    index_put_zeros = 0
+    tensor_conditionals = 0
+    methods = []
+    for _module_name, module in model.named_modules():
         script_module = getattr(module, "_c", None)
         if script_module is None:
             continue
         for method_name in script_module._method_names():
             method = script_module._get_method(method_name)
-            method_replacements = 0
-            if is_repflow:
-                method_replacements += _rewrite_capture_unsafe_scalar_zeros_(
-                    method.graph
-                )
-                method_replacements += _rewrite_capture_unsafe_index_put_zeros_(
-                    method.graph
-                )
-            if is_custom_activation:
-                method_replacements += _rewrite_capture_unsafe_tensor_conditionals_(
-                    method.graph
-                )
-            if method_replacements:
-                method._debug_flush_compilation_cache()
-                replacements += method_replacements
-    return replacements
+            methods.append(method)
+            scalar_zeros += _rewrite_capture_unsafe_scalar_zeros_(method.graph)
+            index_put_zeros += _rewrite_capture_unsafe_index_put_zeros_(
+                method.graph
+            )
+            tensor_conditionals += _rewrite_capture_unsafe_tensor_conditionals_(
+                method.graph
+            )
+
+    residual_tensor_conditionals = sum(
+        _count_capture_unsafe_tensor_conditionals(method.graph)
+        for method in methods
+    )
+    if residual_tensor_conditionals:
+        raise RuntimeError(
+            "DPA3 Opt2 TorchScript rewrite left "
+            f"{residual_tensor_conditionals} capture-unsafe "
+            "bool(torch.any(...)) conditional(s); refusing CUDA Graph capture"
+        )
+
+    total = scalar_zeros + index_put_zeros + tensor_conditionals
+    caches_flushed = 0
+    if total:
+        for method in methods:
+            method._debug_flush_compilation_cache()
+            caches_flushed += 1
+    return JITCaptureRewriteStats(
+        methods_scanned=len(methods),
+        scalar_zeros=scalar_zeros,
+        index_put_zeros=index_put_zeros,
+        tensor_conditionals=tensor_conditionals,
+        caches_flushed=caches_flushed,
+    )
 
 
 class DPA3ModelCUDAGraphEvaluator:
@@ -367,7 +460,7 @@ class DPA3ModelCUDAGraphEvaluator:
 
         self._backend = eager_evaluator._backend
         self._inner = self._backend.dp.model["Default"]
-        self.jit_capture_scalar_zero_rewrites = (
+        self.jit_capture_rewrite_stats = (
             _patch_released_dpa3_jit_for_capture_(self._inner)
         )
         if self._backend._uses_edge_schema:
@@ -640,9 +733,7 @@ class DPA3ModelCUDAGraphEvaluator:
                 self.validation_virial_max_abs_error
             ),
             "capacity_overflow_policy": "device-assert-and-fail-no-fallback",
-            "jit_capture_scalar_zero_rewrites": (
-                self.jit_capture_scalar_zero_rewrites
-            ),
+            "jit_capture_rewrites": self.jit_capture_rewrite_stats.as_dict(),
         }
 
 

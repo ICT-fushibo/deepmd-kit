@@ -16,6 +16,25 @@ from md_benchmark.md_route import MDConfig, MDRunRequest
 _CPU = torch.device("cpu")
 
 
+class _ObscuredActivation(torch.nn.Module):
+    def forward(self, x: torch.Tensor, threshold: float) -> torch.Tensor:
+        silu = torch.nn.functional.silu(x)
+        mask = x > threshold
+        if torch.any(mask):
+            tail = torch.tanh(x - threshold)
+            return torch.where(x < threshold, silu, tail)
+        return silu
+
+
+class _ObscuredContainer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.opaque = _ObscuredActivation()
+
+    def forward(self, x: torch.Tensor, threshold: float) -> torch.Tensor:
+        return self.opaque(x, threshold)
+
+
 def _atoms() -> Atoms:
     return Atoms(
         "H2",
@@ -115,6 +134,46 @@ def test_rewrite_capture_unsafe_boolean_index_put_uses_masked_fill() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "2",
+        "torch.zeros(2)",
+    ],
+)
+def test_rewrite_boolean_index_put_rejects_non_scalar_zero(assignment) -> None:
+    function = torch.jit.CompilationUnit(
+        f"""
+        def assign_value(x: Tensor) -> Tensor:
+            x[x == -1] = {assignment}
+            return x
+        """
+    ).assign_value
+    assert any(node.kind() == "aten::index_put_" for node in function.graph.nodes())
+
+    assert opt2._rewrite_capture_unsafe_index_put_zeros_(function.graph) == 0
+    assert any(node.kind() == "aten::index_put_" for node in function.graph.nodes())
+    assert not any(
+        node.kind() == "aten::masked_fill_" for node in function.graph.nodes()
+    )
+
+
+def test_rewrite_boolean_index_put_accepts_scalar_zeros() -> None:
+    function = torch.jit.CompilationUnit(
+        """
+        def assign_zero(x: Tensor) -> Tensor:
+            x[x == -1] = torch.zeros(())
+            return x
+        """
+    ).assign_zero
+
+    assert opt2._rewrite_capture_unsafe_index_put_zeros_(function.graph) == 1
+    assert not any(node.kind() == "aten::index_put_" for node in function.graph.nodes())
+    assert any(
+        node.kind() == "aten::masked_fill_" for node in function.graph.nodes()
+    )
+
+
 def test_rewrite_capture_unsafe_tensor_conditional_inlines_where_branch() -> None:
     function = torch.jit.CompilationUnit(
         """
@@ -139,6 +198,40 @@ def test_rewrite_capture_unsafe_tensor_conditional_inlines_where_branch() -> Non
         torch.tanh(values),
     )
     torch.testing.assert_close(function(values, 0.0), expected)
+
+
+def test_model_patch_does_not_depend_on_archive_module_names() -> None:
+    model = torch.jit.script(_ObscuredContainer())
+    # Materialize the parent execution plan before mutating its nested child.
+    model(torch.tensor([-1.0, 1.0]), 0.0)
+
+    stats = opt2._patch_released_dpa3_jit_for_capture_(model)
+
+    assert stats.methods_scanned == 2
+    assert stats.tensor_conditionals == 1
+    assert stats.total == 1
+    assert stats.caches_flushed == 2
+    child_graph = model.opaque._c._get_method("forward").graph
+    assert not any(node.kind() == "prim::If" for node in child_graph.nodes())
+    values = torch.tensor([-2.0, 1.0], device=_CPU)
+    expected = torch.where(
+        values < 0.0,
+        torch.nn.functional.silu(values),
+        torch.tanh(values),
+    )
+    torch.testing.assert_close(model(values, 0.0), expected)
+
+
+def test_model_patch_rejects_unhandled_tensor_conditional(monkeypatch) -> None:
+    model = torch.jit.script(_ObscuredContainer())
+    monkeypatch.setattr(
+        opt2,
+        "_rewrite_capture_unsafe_tensor_conditionals_",
+        lambda _graph: 0,
+    )
+
+    with pytest.raises(RuntimeError, match="left 1 capture-unsafe"):
+        opt2._patch_released_dpa3_jit_for_capture_(model)
 
 
 def test_replay_mock_reuses_static_input_and_output_addresses() -> None:
