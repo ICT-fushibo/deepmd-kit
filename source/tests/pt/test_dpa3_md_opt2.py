@@ -35,6 +35,27 @@ class _ObscuredContainer(torch.nn.Module):
         return self.opaque(x, threshold)
 
 
+class _UnhandledActivation(torch.nn.Module):
+    """Independent JIT type for the fail-closed rewrite test."""
+
+    def forward(self, x: torch.Tensor, threshold: float) -> torch.Tensor:
+        silu = torch.nn.functional.silu(x)
+        mask = x > threshold
+        if torch.any(mask):
+            tail = torch.tanh(x - threshold)
+            return torch.where(x < threshold, silu, tail)
+        return silu
+
+
+class _UnhandledContainer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.opaque = _UnhandledActivation()
+
+    def forward(self, x: torch.Tensor, threshold: float) -> torch.Tensor:
+        return self.opaque(x, threshold)
+
+
 def _atoms() -> Atoms:
     return Atoms(
         "H2",
@@ -223,7 +244,11 @@ def test_model_patch_does_not_depend_on_archive_module_names() -> None:
 
 
 def test_model_patch_rejects_unhandled_tensor_conditional(monkeypatch) -> None:
-    model = torch.jit.script(_ObscuredContainer())
+    # TorchScript method graphs are shared by instances of the same scripted
+    # Python type.  The preceding success-path test intentionally mutates the
+    # _ObscuredContainer graph, so this fail-closed test needs an independent
+    # scripted type instead of depending on pytest execution order.
+    model = torch.jit.script(_UnhandledContainer())
     monkeypatch.setattr(
         opt2,
         "_rewrite_capture_unsafe_tensor_conditionals_",
