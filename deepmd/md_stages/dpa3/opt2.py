@@ -53,6 +53,120 @@ class CUDAGraphValidationError(RuntimeError):
     """Raised when replay stability or eager/replay parity validation fails."""
 
 
+_MISSING = object()
+
+
+def _require_legacy_value(
+    options: dict[str, Any], key: str, expected: Any
+) -> bool:
+    """Remove one legacy option only when current code has equal semantics."""
+    value = options.pop(key, _MISSING)
+    if value is _MISSING:
+        return False
+    if value != expected:
+        raise ValueError(
+            "DPA3 Opt2 cannot rehydrate checkpoint option "
+            f"{key}={value!r}; the current implementation only supports "
+            f"the compatibility value {expected!r}"
+        )
+    return True
+
+
+def _map_legacy_alias(
+    options: dict[str, Any], legacy_key: str, current_key: str
+) -> bool:
+    """Translate one renamed option while rejecting conflicting definitions."""
+    value = options.pop(legacy_key, _MISSING)
+    if value is _MISSING:
+        return False
+    if current_key in options and options[current_key] != value:
+        raise ValueError(
+            "DPA3 Opt2 checkpoint defines conflicting options: "
+            f"{legacy_key}={value!r} and "
+            f"{current_key}={options[current_key]!r}"
+        )
+    options[current_key] = value
+    return True
+
+
+def _normalize_released_dpa3_model_params(
+    model_params: dict[str, Any],
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Normalize the released DPA-3.1 schema to the current public schema.
+
+    The released checkpoint was frozen from an experimental descriptor schema.
+    Most extra switches are disabled and therefore have no parameters or forward
+    effect.  Two active legacy names have exact current equivalents:
+    ``use_env_envelope`` is now ``use_exp_switch`` and ``edge_use_dist`` is now
+    ``edge_init_use_dist``.  Anything that would activate an unsupported branch
+    is rejected instead of being silently ignored; compact/padded E/F/virial
+    parity remains the final scientific guard.
+    """
+    normalized = copy.deepcopy(model_params)
+    descriptor = normalized.get("descriptor")
+    if not isinstance(descriptor, dict):
+        raise ValueError("DPA3 Opt2 checkpoint has no descriptor configuration")
+    repflow = descriptor.get("repflow")
+    if not isinstance(repflow, dict):
+        raise ValueError("DPA3 Opt2 checkpoint has no descriptor.repflow mapping")
+
+    consumed: list[str] = []
+    if _require_legacy_value(descriptor, "use_torch_embed", False):
+        consumed.append("descriptor.use_torch_embed")
+    if _map_legacy_alias(repflow, "use_env_envelope", "use_exp_switch"):
+        consumed.append("descriptor.repflow.use_env_envelope->use_exp_switch")
+    if _map_legacy_alias(repflow, "edge_use_dist", "edge_init_use_dist"):
+        consumed.append("descriptor.repflow.edge_use_dist->edge_init_use_dist")
+
+    no_op_values = {
+        "smooth_angle_init": False,
+        "angle_init_use_sin": False,
+        "angle_multi_freq": None,
+        "use_new_sw": False,
+        "update_dihedral": False,
+        "use_ffn_node_edge_message": False,
+        "use_ffn_edge_edge_message": False,
+        "use_ffn_edge_angle_message": False,
+        "use_ffn_angle_angle_message": False,
+        "edge_use_concat_rbf": False,
+        "edge_use_rbf": False,
+        "embed_use_bias": True,
+        "edge_use_attn": False,
+        "edge_rbf_dot_self": False,
+        "edge_rbf_dot_message": False,
+        "edge_use_esen_rbf": False,
+        "edge_use_esen_atom_ebd": False,
+        "edge_use_esen_env": False,
+        "residual_pref": [],
+        "tebd_use_act": True,
+        "message_use_self_concat": False,
+        "use_combined_output": False,
+        "use_slim_message": False,
+    }
+    for key, expected in no_op_values.items():
+        if _require_legacy_value(repflow, key, expected):
+            consumed.append(f"descriptor.repflow.{key}")
+
+    # These tuning values are inactive because their owning feature switches
+    # were required to be false above.  They cannot affect the rebuilt graph.
+    inactive_tuning = (
+        "d_dim",
+        "d_sel",
+        "d_rcut",
+        "d_rcut_smth",
+        "ffn_hidden_dim",
+        "edge_attn_hidden",
+        "edge_attn_head",
+        "edge_attn_use_ln",
+    )
+    for key in inactive_tuning:
+        if key in repflow:
+            repflow.pop(key)
+            consumed.append(f"descriptor.repflow.{key}")
+
+    return normalized, tuple(consumed)
+
+
 def _resolve_fixed_neighbor_slots(
     requested: Any,
     checkpoint_slots: int,
@@ -102,12 +216,15 @@ def _rehydrate_static_dynamic_model(
     scripted_model: Any,
     model_params: dict[str, Any],
     device: torch.device,
-) -> Any:
+) -> tuple[Any, tuple[str, ...]]:
     """Rebuild the frozen DPA3 as eager PT with fixed padded dynamic selection."""
     from deepmd.pt.model.model import get_model
 
+    normalized_params, compatibility_options = (
+        _normalize_released_dpa3_model_params(model_params)
+    )
     with torch.device(device):
-        model = get_model(copy.deepcopy(model_params)).to(device)
+        model = get_model(normalized_params).to(device)
     incompatible = model.load_state_dict(scripted_model.state_dict(), strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         raise RuntimeError(
@@ -129,7 +246,7 @@ def _rehydrate_static_dynamic_model(
     model.eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    return model
+    return model, compatibility_options
 
 
 def _copy_fixed_tensor_(name: str, destination: Tensor, source: Tensor) -> None:
@@ -559,10 +676,12 @@ class DPA3ModelCUDAGraphEvaluator:
         )
         self.checkpoint_neighbor_slots = checkpoint_slots
         self.initial_max_neighbors = int(initial_max)
-        self._inner = _rehydrate_static_dynamic_model(
-            self._archive_inner,
-            self._backend.get_model_def_script(),
-            self.device,
+        self._inner, self.checkpoint_compatibility_options = (
+            _rehydrate_static_dynamic_model(
+                self._archive_inner,
+                self._backend.get_model_def_script(),
+                self.device,
+            )
         )
         self.jit_capture_rewrite_stats = JITCaptureRewriteStats(
             methods_scanned=0,
@@ -879,6 +998,9 @@ class DPA3ModelCUDAGraphEvaluator:
             "fixed_neighbor_slots": self.fixed_neighbor_slots,
             "checkpoint_neighbor_slots": self.checkpoint_neighbor_slots,
             "initial_max_neighbors": self.initial_max_neighbors,
+            "checkpoint_compatibility_options": list(
+                self.checkpoint_compatibility_options
+            ),
             "jit_capture_rewrites": self.jit_capture_rewrite_stats.as_dict(),
         }
 

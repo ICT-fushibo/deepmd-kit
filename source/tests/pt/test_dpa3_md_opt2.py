@@ -272,6 +272,77 @@ def test_fixed_neighbor_slot_configuration() -> None:
         opt2._resolve_fixed_neighbor_slots(1201, 1200, 100, **kwargs)
 
 
+def test_released_checkpoint_schema_normalization_is_fail_closed() -> None:
+    repflow = {
+        "use_env_envelope": True,
+        "edge_use_dist": False,
+        "smooth_angle_init": False,
+        "angle_init_use_sin": False,
+        "angle_multi_freq": None,
+        "use_new_sw": False,
+        "update_dihedral": False,
+        "d_dim": 32,
+        "d_sel": 10,
+        "d_rcut": 2.8,
+        "d_rcut_smth": 2.0,
+        "use_ffn_node_edge_message": False,
+        "use_ffn_edge_edge_message": False,
+        "use_ffn_edge_angle_message": False,
+        "use_ffn_angle_angle_message": False,
+        "ffn_hidden_dim": 1024,
+        "edge_use_concat_rbf": False,
+        "edge_use_rbf": False,
+        "embed_use_bias": True,
+        "edge_use_attn": False,
+        "edge_attn_hidden": 32,
+        "edge_attn_head": 4,
+        "edge_attn_use_ln": True,
+        "edge_rbf_dot_self": False,
+        "edge_rbf_dot_message": False,
+        "edge_use_esen_rbf": False,
+        "edge_use_esen_atom_ebd": False,
+        "edge_use_esen_env": False,
+        "residual_pref": [],
+        "tebd_use_act": True,
+        "message_use_self_concat": False,
+        "use_combined_output": False,
+        "use_slim_message": False,
+    }
+    params = {
+        "descriptor": {
+            "type": "dpa3",
+            "use_torch_embed": False,
+            "repflow": repflow,
+        }
+    }
+
+    normalized, consumed = opt2._normalize_released_dpa3_model_params(params)
+
+    # The caller-owned checkpoint definition must remain untouched.
+    assert params["descriptor"]["use_torch_embed"] is False
+    assert params["descriptor"]["repflow"]["use_env_envelope"] is True
+    descriptor = normalized["descriptor"]
+    normalized_repflow = descriptor["repflow"]
+    assert "use_torch_embed" not in descriptor
+    assert normalized_repflow == {
+        "use_exp_switch": True,
+        "edge_init_use_dist": False,
+    }
+    assert "descriptor.use_torch_embed" in consumed
+    assert (
+        "descriptor.repflow.use_env_envelope->use_exp_switch" in consumed
+    )
+
+    active = {
+        "descriptor": {
+            "type": "dpa3",
+            "repflow": {"update_dihedral": True},
+        }
+    }
+    with pytest.raises(ValueError, match="update_dihedral=True"):
+        opt2._normalize_released_dpa3_model_params(active)
+
+
 def test_static_dynamic_indices_and_edge_reduction_match_compact() -> None:
     from deepmd.pt.model.descriptor.repflows import _get_static_graph_index
     from deepmd.pt.model.network.utils import aggregate, get_graph_index
