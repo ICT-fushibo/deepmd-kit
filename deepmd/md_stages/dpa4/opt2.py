@@ -253,6 +253,7 @@ class DPA4ModelOnlyGraphEvaluator(DPA4EnergyForceEvaluator):
         )
         self.initial_edge_count = initial_edge_count
         self.last_edge_count = initial_edge_count
+        self.max_edge_count = initial_edge_count
         self.graph_edge_capacity = edge_capacity
         self._input_addresses = self._static.addresses()
         self.neighbor_backend = "dpa4-internal-nvalchemiops-eager-outside-graph"
@@ -525,6 +526,7 @@ class DPA4ModelOnlyGraphEvaluator(DPA4EnergyForceEvaluator):
             with self.profiler.phase("neighbor_list"):
                 schema = self._build_edge_schema(model_positions)
             self.last_edge_count = self._static.copy_schema_(schema)
+            self.max_edge_count = max(self.max_edge_count, self.last_edge_count)
             self._assert_static_addresses()
             with self.profiler.phase("model_energy_force"):
                 self._graph.replay()
@@ -670,6 +672,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "graph_edge_capacity": evaluator.graph_edge_capacity,
         "graph_initial_edge_count": evaluator.initial_edge_count,
         "graph_final_edge_count": evaluator.last_edge_count,
+        "graph_max_edge_count": evaluator.max_edge_count,
         "graph_overflow_policy": "explicit-error-no-truncation-no-fallback",
         "graph_input_addresses_fixed": True,
         "graph_output_addresses_fixed": True,
