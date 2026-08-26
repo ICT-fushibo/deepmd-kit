@@ -594,6 +594,8 @@ def _run_measured_loop(
             memory_frames=memory_frames,
             partial_path=partial_path,
         )
+    if config.collect_statistics and 0 in observation_steps:
+        observations.append(_observation(0, state, masses))
 
     for step in range(1, config.steps + 1):
         if profiler is None:
