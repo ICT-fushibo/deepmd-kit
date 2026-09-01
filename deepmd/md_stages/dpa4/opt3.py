@@ -1,8 +1,8 @@
 """DPA4 Opt3: one-capacity whole-step CUDA Graph molecular dynamics.
 
 The complete unconstrained NVT step is captured: Berendsen or Nose-Hoover
-Chain integration, fixed-capacity nvalchemiops neighbour construction, the
-SeZM forward/force path, and the persistent GPU-state update.  Capacity uses
+Chain integration, fixed-candidate PBC neighbour construction, the SeZM
+forward/force path, and the persistent GPU-state update.  Capacity uses
 the eSEN-style uniform per-atom CAP policy.  Real edge counts may vary while
 the edge tensor shape stays fixed; unused slots are masked, non-zero-distance
 self sinks distributed over the atoms.
@@ -66,6 +66,130 @@ class _CapacityPlan:
     edge_capacity: int
     neighbors_per_atom: int
     candidate_slots: int
+    source: str
+    guarded_initial_neighbors: int
+    total_edge_derived_neighbors: int | None
+
+
+def _pbc_repetitions(cell: Tensor, cutoff: float) -> tuple[int, int, int]:
+    """Resolve the complete periodic candidate range during setup only."""
+    cell_cpu = cell.detach().to(device="cpu", dtype=torch.float64).reshape(3, 3)
+    cross_a2a3 = torch.cross(cell_cpu[1], cell_cpu[2], dim=0)
+    volume = torch.dot(cell_cpu[0], cross_a2a3)
+    if not bool(torch.isfinite(volume)) or float(volume.abs()) == 0.0:
+        raise ValueError("DPA4 Opt3 cannot enumerate a singular periodic cell")
+    reciprocal = (
+        cross_a2a3,
+        torch.cross(cell_cpu[2], cell_cpu[0], dim=0),
+        torch.cross(cell_cpu[0], cell_cpu[1], dim=0),
+    )
+    return tuple(
+        int(torch.ceil(cutoff * torch.linalg.vector_norm(vector / volume)).item())
+        for vector in reciprocal
+    )  # type: ignore[return-value]
+
+
+class _FixedShapeDPA4NeighborBuilder:
+    """Capture-safe fixed candidate builder for one fully periodic frame.
+
+    nvalchemiops' public neighbor-list entry performs setup work on every call
+    and is not stream-capture safe.  This builder moves PBC enumeration to
+    initialization and leaves only fixed-shape CUDA tensor operations in the
+    whole-step graph.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_atoms: int,
+        cell: Tensor,
+        cutoff: float,
+        neighbors_per_atom: int,
+    ) -> None:
+        if num_atoms < 1:
+            raise ValueError("DPA4 Opt3 requires at least one atom")
+        if cutoff <= 0.0:
+            raise ValueError("DPA4 Opt3 cutoff must be positive")
+        if neighbors_per_atom < 1:
+            raise ValueError("DPA4 Opt3 neighbors_per_atom must be positive")
+        self.num_atoms = int(num_atoms)
+        self.cutoff = float(cutoff)
+        self.neighbors_per_atom = int(neighbors_per_atom)
+        self.device = cell.device
+        self.cell = cell.detach().reshape(3, 3).contiguous()
+        self.inverse_cell = torch.linalg.inv(self.cell).contiguous()
+        self.repetitions = _pbc_repetitions(self.cell, self.cutoff)
+        axes = [
+            torch.arange(
+                -repeat,
+                repeat + 1,
+                dtype=self.cell.dtype,
+                device=self.device,
+            )
+            for repeat in self.repetitions
+        ]
+        self.unit_shifts = torch.cartesian_prod(*axes).reshape(-1, 3).contiguous()
+        self.num_cells = int(self.unit_shifts.shape[0])
+        self.candidates_per_atom = self.num_atoms * self.num_cells
+        if self.neighbors_per_atom > self.candidates_per_atom:
+            raise ValueError(
+                "DPA4 Opt3 neighbor capacity exceeds the complete PBC universe"
+            )
+        self.candidate_sources = torch.arange(
+            self.num_atoms, dtype=torch.long, device=self.device
+        ).repeat_interleave(self.num_cells)
+        self.candidate_shifts = self.unit_shifts.repeat(self.num_atoms, 1)
+        self.candidate_ids = torch.arange(
+            self.candidates_per_atom, dtype=torch.long, device=self.device
+        ).reshape(1, -1)
+        self.centres = torch.arange(
+            self.num_atoms, dtype=torch.long, device=self.device
+        ).reshape(-1, 1)
+
+    def build(
+        self, positions: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Return wrapped positions and one fixed row of slots per centre."""
+        if positions.shape != (self.num_atoms, 3):
+            raise ValueError("DPA4 fixed builder received the wrong atom shape")
+        fractional = torch.mm(positions, self.inverse_cell)
+        wrapped = torch.mm(torch.remainder(fractional, 1.0), self.cell)
+        # Use wrapped coordinates consistently for both centres and images.
+        shifted_sources = wrapped.index_select(0, self.candidate_sources) + torch.mm(
+            self.candidate_shifts.to(dtype=positions.dtype), self.cell
+        )
+        vectors = shifted_sources.unsqueeze(0) - wrapped.unsqueeze(1)
+        distance_sqr = vectors.square().sum(dim=-1)
+        valid = (distance_sqr <= self.cutoff * self.cutoff) & (
+            distance_sqr > 1.0e-10
+        )
+        counts = valid.sum(dim=1)
+        candidates = self.candidate_ids.expand(self.num_atoms, -1)
+        ordered = torch.where(
+            valid,
+            candidates,
+            torch.full_like(candidates, self.candidates_per_atom),
+        )
+        selected = torch.topk(
+            ordered,
+            k=self.neighbors_per_atom,
+            dim=1,
+            largest=False,
+            sorted=True,
+        ).values
+        selected_valid = selected < self.candidates_per_atom
+        safe = selected.clamp_max(self.candidates_per_atom - 1)
+        sources = self.candidate_sources.index_select(0, safe.reshape(-1)).reshape(
+            self.num_atoms, self.neighbors_per_atom
+        )
+        shifts = self.candidate_shifts.index_select(0, safe.reshape(-1)).reshape(
+            self.num_atoms, self.neighbors_per_atom, 3
+        )
+        sources = torch.where(selected_valid, sources, self.centres)
+        shifts = torch.where(
+            selected_valid.unsqueeze(-1), shifts, torch.zeros_like(shifts)
+        )
+        return wrapped.reshape(1, self.num_atoms, 3), sources, counts, shifts
 
 
 def _resolve_capacity_plan(
@@ -90,27 +214,42 @@ def _resolve_capacity_plan(
     if capacity_alignment < 1:
         raise ValueError("graph_edge_capacity_alignment must be positive")
 
+    guarded_initial = max(
+        initial_max_neighbors + int(capacity_headroom),
+        math.ceil(initial_max_neighbors * float(capacity_factor)),
+        1,
+    )
+    aligned_guarded_initial = _round_up(
+        guarded_initial, int(capacity_alignment)
+    )
+    total_edge_derived: int | None = None
+
     if explicit_edge_capacity is not None:
         requested_edge_capacity = int(explicit_edge_capacity)
         if requested_edge_capacity < atom_count:
             raise ValueError(
                 "graph_edge_capacity must provide at least one slot per atom"
             )
+        total_edge_derived = _round_up(
+            math.ceil(requested_edge_capacity / atom_count),
+            int(capacity_alignment),
+        )
         if explicit_search_capacity is None:
-            # A total-edge probe does not bound an individual high-coordinate
-            # center.  Convert it conservatively to a uniform row width, align
-            # to the eSEN slot quantum, then add one complete guard bucket.
-            inferred_search_capacity = math.ceil(
-                requested_edge_capacity / atom_count
+            # The total-edge probe already includes factor/headroom. Align it
+            # once, then combine it with the independently guarded initial
+            # per-center maximum. Adding another alignment bucket here would
+            # apply the safety margin twice (for bulkCu: 88 -> 96).
+            search_capacity = max(
+                total_edge_derived,
+                aligned_guarded_initial,
             )
-            search_capacity = (
-                _round_up(inferred_search_capacity, capacity_alignment)
-                + capacity_alignment
-            )
+            source = "total-edge-probe-plus-initial-per-atom"
         else:
-            # An explicit per-center value is authoritative and intentionally
-            # overrides the inferred guard policy.
+            # The scheduler supplies this from the maximum per-center count
+            # observed over the probe trajectory. The runtime overflow assert
+            # remains the final safety net.
             search_capacity = int(explicit_search_capacity)
+            source = "total-edge-and-per-atom-probe"
         if search_capacity < 1:
             raise ValueError("neighbor_search_capacity must be positive")
         edge_capacity = max(
@@ -118,15 +257,15 @@ def _resolve_capacity_plan(
             atom_count * search_capacity,
         )
     else:
-        requested = max(
-            initial_max_neighbors + int(capacity_headroom),
-            math.ceil(initial_max_neighbors * float(capacity_factor)),
-            1,
-        )
         search_capacity = (
-            _round_up(requested, int(capacity_alignment))
+            aligned_guarded_initial
             if explicit_search_capacity is None
             else int(explicit_search_capacity)
+        )
+        source = (
+            "initial-per-atom-auto"
+            if explicit_search_capacity is None
+            else "explicit-per-atom"
         )
         if search_capacity < 1:
             raise ValueError("neighbor_search_capacity must be positive")
@@ -142,6 +281,9 @@ def _resolve_capacity_plan(
         edge_capacity=edge_capacity,
         neighbors_per_atom=search_capacity,
         candidate_slots=candidate_slots,
+        source=source,
+        guarded_initial_neighbors=aligned_guarded_initial,
+        total_edge_derived_neighbors=total_edge_derived,
     )
 
 
@@ -282,8 +424,6 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         if state.positions.data_ptr() == state.momenta.data_ptr():
             raise RuntimeError("positions and momenta must have distinct storage")
 
-        from deepmd.pt.utils.nv_nlist import NvNeighborList
-
         self.state = state
         self.masses = masses.reshape(-1, 1)
         self.request = request
@@ -297,16 +437,14 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             "p_eta": float(validation_thermostat_atol),
         }
         self._integrator = _build_integrator(request, masses)
-        self._neighbor_builder = NvNeighborList(compile_truncation=False)
         n_atoms = int(self.atom_types.shape[1])
         initial_model_positions = state.positions.to(dtype=self.model_dtype).reshape(
             1, n_atoms, 3
         )
 
-        # This initial search is the only topology-dependent host read.  Keep
-        # it separate from ``prepare_fixed_shape``: that general DeepMD helper
-        # never chooses fewer than sum(sel)=384 slots, whereas eSEN CAP should
-        # follow the observed per-center maximum (plus guard/alignment).
+        # This initial search is the only topology-dependent host read.  The
+        # nvalchemiops entry remains a setup-only scientific reference; graph
+        # replay uses the capture-safe frozen candidate universe below.
         from deepmd.pt_expt.utils.nv_graph_builder import nv_search_matrix
 
         _, _, _, initial_num_neighbors, _ = nv_search_matrix(
@@ -325,15 +463,35 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             explicit_edge_capacity=graph_edge_capacity,
             explicit_search_capacity=neighbor_search_capacity,
         )
-        self._neighbor_builder.prepare_fixed_shape(
-            initial_model_positions,
-            self.cell,
-            float(self._model.get_rcut()),
-            list(self._model.get_sel()),
-            search_capacity=self.capacity_plan.neighbors_per_atom,
+        self._fixed_builder = _FixedShapeDPA4NeighborBuilder(
+            num_atoms=n_atoms,
+            cell=self.cell[0],
+            cutoff=float(self._model.get_rcut()),
+            neighbors_per_atom=self.capacity_plan.neighbors_per_atom,
         )
-        self.neighbor_shape_metadata = self._neighbor_builder.fixed_shape_metadata()
-        self.neighbor_backend = "dpa4-nvalchemiops-fixed-cap-inside-graph"
+        _, _, fixed_initial_counts, _ = self._fixed_builder.build(
+            initial_model_positions[0]
+        )
+        fixed_initial_max = int(fixed_initial_counts.max().detach().cpu())
+        if fixed_initial_max != initial_max_neighbors:
+            raise RuntimeError(
+                "DPA4 Opt3 fixed candidate builder disagrees with the setup "
+                f"nvalchemiops probe: {fixed_initial_max} != "
+                f"{initial_max_neighbors}"
+            )
+        self.neighbor_shape_metadata = {
+            "initial_max_neighbors": initial_max_neighbors,
+            "search_capacity": self.capacity_plan.neighbors_per_atom,
+            "edge_capacity": self.capacity_plan.edge_capacity,
+            "candidate_universe_size": (
+                n_atoms * self._fixed_builder.candidates_per_atom
+            ),
+            "candidates_per_atom": self._fixed_builder.candidates_per_atom,
+            "num_pbc_cells": self._fixed_builder.num_cells,
+            "pbc_repetitions": list(self._fixed_builder.repetitions),
+            "capture_safe_setup_hoisted": True,
+        }
+        self.neighbor_backend = "dpa4-fixed-candidate-cap-inside-graph"
 
         self._last_required_neighbors = torch.tensor(
             initial_max_neighbors, dtype=torch.int64, device=self.device
@@ -404,16 +562,8 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         return tuple(tensor.data_ptr() for tensor in tensors)
 
     def _build_fixed_edge_schema(self, positions: Tensor) -> EdgeNeighborList:
-        from deepmd.pt_expt.utils.nv_graph_builder import nv_search_matrix_fixed
-
-        coord = positions.to(dtype=self.model_dtype).reshape(1, -1, 3)
-        coord, cell, neighbor_matrix, num_neighbors, shifts = (
-            nv_search_matrix_fixed(
-                coord,
-                self.cell,
-                float(self._model.get_rcut()),
-                capacity=self.capacity_plan.neighbors_per_atom,
-            )
+        coord, neighbor_matrix, num_neighbors, shifts = self._fixed_builder.build(
+            positions.to(dtype=self.model_dtype)
         )
         required = num_neighbors.max().to(dtype=torch.int64)
         overflow = required > self.capacity_plan.neighbors_per_atom
@@ -423,10 +573,9 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         )
         self._overflow_flag.logical_or_(overflow)
         self._overflow_count.add_(overflow.to(dtype=torch.int64))
-        # Keep this local assertion in addition to nv_search_matrix_fixed's
-        # assertion.  The persistent status above makes the requirement visible
-        # in metadata and tests; the assertion prevents a truncated replay from
-        # ever being accepted as an MD step.
+        # The persistent status above makes the requirement visible in metadata
+        # and tests; the assertion prevents a truncated replay from ever being
+        # accepted as an MD step.
         torch._assert_async(
             ~overflow,
             "DPA4 Opt3 per-atom neighbor capacity exceeded; increase "
@@ -435,7 +584,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         return _fixed_edge_schema_from_neighbor_matrix(
             coord=coord,
             atype=self.atom_types,
-            cell=cell,
+            cell=self.cell,
             neighbor_matrix=neighbor_matrix,
             num_neighbors=num_neighbors,
             shifts=shifts,
@@ -849,17 +998,23 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "graph_edge_capacity": runner.capacity_plan.edge_capacity,
         "graph_candidate_slots": runner.capacity_plan.candidate_slots,
         "graph_neighbors_per_atom": runner.capacity_plan.neighbors_per_atom,
+        "graph_capacity_source": runner.capacity_plan.source,
+        "graph_capacity_guarded_initial_neighbors": (
+            runner.capacity_plan.guarded_initial_neighbors
+        ),
+        "graph_capacity_total_edge_derived_neighbors": (
+            runner.capacity_plan.total_edge_derived_neighbors
+        ),
         "graph_max_required_neighbors": runner.max_required_neighbors,
         "graph_overflow_count": runner.overflow_count,
         "graph_initial_edge_count": runner.initial_edge_count,
         "graph_final_edge_count": runner.last_edge_count,
         "graph_max_edge_count": runner.max_edge_count,
         "graph_capacity_policy": "esen-cap-uniform-per-atom-single-graph",
-        "graph_capacity_guard_neighbors": (
-            configured_capacity_alignment
-            if configured_edge_capacity is not None
-            and configured_search_capacity is None
-            else 0
+        "graph_capacity_guard_neighbors": max(
+            0,
+            runner.capacity_plan.neighbors_per_atom
+            - int(runner.neighbor_shape_metadata["initial_max_neighbors"]),
         ),
         "graph_padding_policy": "distributed-masked-self-sink-far-vector",
         "graph_overflow_policy": "explicit-error-no-rollback-no-fallback",

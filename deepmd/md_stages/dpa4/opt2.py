@@ -79,6 +79,28 @@ def _resolve_edge_capacity(
     )
 
 
+def _max_real_neighbors(
+    schema: EdgeNeighborList,
+    *,
+    atom_count: int,
+) -> Tensor:
+    """Return the largest real incoming-edge count without a host sync."""
+    if atom_count < 1:
+        raise ValueError("atom_count must be positive")
+    destinations = schema.edge_index[1].to(dtype=torch.long)
+    counts = torch.zeros(
+        atom_count,
+        dtype=torch.int64,
+        device=destinations.device,
+    )
+    counts.scatter_add_(
+        0,
+        destinations,
+        schema.edge_mask.to(dtype=torch.int64),
+    )
+    return counts.max()
+
+
 @dataclass
 class _StaticEdgeGraphInputs:
     """Fixed-address tensors consumed by the captured SeZM lower graph."""
@@ -192,6 +214,7 @@ class DPA4ModelOnlyGraphEvaluator(DPA4EnergyForceEvaluator):
         neighbor_capacity_factor: float = 1.25,
         neighbor_capacity_headroom: int = 16,
         neighbor_search_capacity: int | None = None,
+        track_neighbor_capacity: bool = False,
         capture_warmup_replays: int = 3,
         validation_energy_atol: float = 1.0e-6,
         validation_force_atol: float = 1.0e-6,
@@ -240,6 +263,16 @@ class DPA4ModelOnlyGraphEvaluator(DPA4EnergyForceEvaluator):
             search_capacity=neighbor_search_capacity,
         )
         initial_schema = self._build_edge_schema(initial_positions)
+        self._track_neighbor_capacity = bool(track_neighbor_capacity)
+        self._last_required_neighbors: Tensor | None = None
+        self._max_required_neighbors: Tensor | None = None
+        if self._track_neighbor_capacity:
+            initial_required = _max_real_neighbors(
+                initial_schema,
+                atom_count=int(self.atom_types.shape[1]),
+            )
+            self._last_required_neighbors = initial_required.clone()
+            self._max_required_neighbors = initial_required.clone()
         initial_edge_count = int(initial_schema.edge_vec.shape[0])
         edge_capacity = _resolve_edge_capacity(
             initial_edge_count,
@@ -525,6 +558,17 @@ class DPA4ModelOnlyGraphEvaluator(DPA4EnergyForceEvaluator):
                 model_positions = positions.to(dtype=self.model_dtype).unsqueeze(0)
             with self.profiler.phase("neighbor_list"):
                 schema = self._build_edge_schema(model_positions)
+            if self._track_neighbor_capacity:
+                assert self._last_required_neighbors is not None
+                assert self._max_required_neighbors is not None
+                required = _max_real_neighbors(
+                    schema,
+                    atom_count=int(self.atom_types.shape[1]),
+                )
+                self._last_required_neighbors.copy_(required)
+                self._max_required_neighbors.copy_(
+                    torch.maximum(self._max_required_neighbors, required)
+                )
             self.last_edge_count = self._static.copy_schema_(schema)
             self.max_edge_count = max(self.max_edge_count, self.last_edge_count)
             self._assert_static_addresses()
@@ -536,6 +580,12 @@ class DPA4ModelOnlyGraphEvaluator(DPA4EnergyForceEvaluator):
             self._captured_energy,
             self._captured_virial,
         )
+
+    @property
+    def max_required_neighbors(self) -> int | None:
+        if self._max_required_neighbors is None:
+            return None
+        return int(self._max_required_neighbors.detach().cpu())
 
 
 def run_md(request: MDRunRequest) -> MDRunResult:
@@ -615,6 +665,9 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             None
             if configured_search_capacity is None
             else int(configured_search_capacity)
+        ),
+        track_neighbor_capacity=bool(
+            request.options.get("capacity_probe_collect_per_atom", False)
         ),
         capture_warmup_replays=int(
             request.options.get("cuda_graph_capture_warmup_replays", 3)
@@ -728,6 +781,10 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "deepmd_inference_env": dict(_DEEPMD_OPT1_ENV),
         "performance_profile": profiler.summary(synchronize=False),
     }
+    max_required_neighbors = evaluator.max_required_neighbors
+    if max_required_neighbors is not None:
+        metadata["graph_max_required_neighbors"] = max_required_neighbors
+        metadata["capacity_probe_collect_per_atom"] = True
     if request.config.integrator == "nose_hoover_chain":
         metadata["nose_hoover_chain"] = {
             "tchain": int(request.options.get("tchain", 3)),

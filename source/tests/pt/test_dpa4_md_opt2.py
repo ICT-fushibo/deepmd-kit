@@ -128,6 +128,17 @@ def test_edge_capacity_is_preflighted_without_silent_truncation() -> None:
         )
 
 
+def test_max_real_neighbors_ignores_masked_sink_edges() -> None:
+    schema = _schema(6)
+    schema.edge_index[1] = torch.tensor([0, 0, 1, 1, 1, 0])
+    schema.edge_mask[:] = torch.tensor([True, True, True, True, True, False])
+
+    required = opt2._max_real_neighbors(schema, atom_count=2)
+
+    assert required.dtype is torch.int64
+    assert required.item() == 3
+
+
 def test_static_edge_buffers_keep_addresses_and_mask_unused_tail() -> None:
     buffers = opt2._StaticEdgeGraphInputs.allocate(_schema(5), capacity=8)
     initial_addresses = buffers.addresses()
@@ -225,6 +236,7 @@ def test_hot_path_builds_and_copies_edges_before_graph_replay(monkeypatch) -> No
     )
     evaluator._graph = SimpleNamespace(replay=lambda: events.append("replay"))
     evaluator.production_replays = 0
+    evaluator._track_neighbor_capacity = False
     evaluator._build_edge_schema = lambda _positions: (
         events.append("build") or _schema(4)
     )
