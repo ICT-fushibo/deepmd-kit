@@ -271,11 +271,13 @@ def test_fixed_candidate_builder_matches_simple_periodic_topology() -> None:
 
 def test_skin_builder_matches_full_search_with_per_atom_cap() -> None:
     positions = torch.tensor(
-        [[0.1, 0.0, 0.0], [4.8, 0.0, 0.0]], dtype=torch.float64
+        [[0.1, 0.0, 0.0], [4.8, 0.0, 0.0]],
+        dtype=torch.float64,
+        device="cpu",
     )
     options = dict(
         num_atoms=2,
-        cell=torch.eye(3, dtype=torch.float64) * 5.0,
+        cell=torch.eye(3, dtype=torch.float64, device="cpu") * 5.0,
         cutoff=1.0,
         neighbors_per_atom=2,
         neighbor_capacities=[1, 2],
