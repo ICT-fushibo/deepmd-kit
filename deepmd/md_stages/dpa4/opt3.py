@@ -671,6 +671,10 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             verlet_skin=float(request.options.get("verlet_skin", 0.0)),
             verlet_candidate_capacity=request.options.get("verlet_candidate_capacity"),
         )
+        # Keep the per-atom CAP on the model device.  This tensor is read by
+        # the captured builder path; converting the Python list during replay
+        # would introduce a CPU-to-CUDA copy that CUDA Graph rejects.
+        self._neighbor_capacities_tensor = self._fixed_builder.neighbor_capacities
         self._fixed_builder.initialize_skin(initial_model_positions[0])
         self.verlet_rebuild_interval = int(
             request.options.get("verlet_rebuild_interval", 0)
@@ -795,9 +799,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         required = num_neighbors.max().to(dtype=torch.int64)
         overflow_by_atom = torch.clamp_min(
             num_neighbors
-            - torch.as_tensor(
-                self.neighbor_capacities, dtype=torch.long, device=self.device
-            ),
+            - self._neighbor_capacities_tensor,
             0,
         )
         overflow = overflow_by_atom.max() > 0
