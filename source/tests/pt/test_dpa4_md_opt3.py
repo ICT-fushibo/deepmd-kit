@@ -269,6 +269,37 @@ def test_fixed_candidate_builder_matches_simple_periodic_topology() -> None:
     assert torch.equal(shifts, torch.zeros_like(shifts))
 
 
+def test_skin_builder_matches_full_search_with_per_atom_cap() -> None:
+    positions = torch.tensor(
+        [[0.1, 0.0, 0.0], [4.8, 0.0, 0.0]], dtype=torch.float64
+    )
+    options = dict(
+        num_atoms=2,
+        cell=torch.eye(3, dtype=torch.float64) * 5.0,
+        cutoff=1.0,
+        neighbors_per_atom=2,
+        neighbor_capacities=[1, 2],
+    )
+    full = opt3._FixedShapeDPA4NeighborBuilder(**options)
+    skin = opt3._FixedShapeDPA4NeighborBuilder(
+        **options, verlet_skin=0.5, verlet_candidate_capacity=4
+    )
+    skin.initialize_skin(positions)
+
+    full_output = full.build(positions)
+    skin_output = skin.build(positions)
+    for actual, expected in zip(skin_output, full_output):
+        torch.testing.assert_close(actual, expected)
+    assert skin.edge_capacity == 3
+
+    # Crossing a periodic boundary by less than skin/2 must update the cached
+    # image shift without forcing a rebuild or dropping the edge.
+    moved = positions.clone()
+    moved[0, 0] = -0.1
+    for actual, expected in zip(skin.build(moved), full.build(moved)):
+        torch.testing.assert_close(actual, expected)
+
+
 def test_validation_distinguishes_hard_state_contract_and_warning_tolerance() -> None:
     capture_source = inspect.getsource(
         opt3.DPA4WholeStepGraph._capture_whole_step_graph

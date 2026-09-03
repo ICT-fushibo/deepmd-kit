@@ -101,6 +101,13 @@ def _max_real_neighbors(
     return counts.max()
 
 
+def _real_neighbor_counts(schema: EdgeNeighborList, *, atom_count: int) -> Tensor:
+    destinations = schema.edge_index[1].to(dtype=torch.long)
+    counts = torch.zeros(atom_count, dtype=torch.int64, device=destinations.device)
+    counts.scatter_add_(0, destinations, schema.edge_mask.to(dtype=torch.int64))
+    return counts
+
+
 @dataclass
 class _StaticEdgeGraphInputs:
     """Fixed-address tensors consumed by the captured SeZM lower graph."""
@@ -266,6 +273,8 @@ class DPA4ModelOnlyGraphEvaluator(DPA4EnergyForceEvaluator):
         self._track_neighbor_capacity = bool(track_neighbor_capacity)
         self._last_required_neighbors: Tensor | None = None
         self._max_required_neighbors: Tensor | None = None
+        self._initial_neighbors_by_atom: list[int] | None = None
+        self._max_neighbors_by_atom: list[int] | None = None
         if self._track_neighbor_capacity:
             initial_required = _max_real_neighbors(
                 initial_schema,
@@ -273,6 +282,11 @@ class DPA4ModelOnlyGraphEvaluator(DPA4EnergyForceEvaluator):
             )
             self._last_required_neighbors = initial_required.clone()
             self._max_required_neighbors = initial_required.clone()
+            initial_counts = _real_neighbor_counts(
+                initial_schema, atom_count=int(self.atom_types.shape[1])
+            )
+            self._initial_neighbors_by_atom = initial_counts.detach().cpu().tolist()
+            self._max_neighbors_by_atom = list(self._initial_neighbors_by_atom)
         initial_edge_count = int(initial_schema.edge_vec.shape[0])
         edge_capacity = _resolve_edge_capacity(
             initial_edge_count,
@@ -569,6 +583,13 @@ class DPA4ModelOnlyGraphEvaluator(DPA4EnergyForceEvaluator):
                 self._max_required_neighbors.copy_(
                     torch.maximum(self._max_required_neighbors, required)
                 )
+                counts = _real_neighbor_counts(
+                    schema, atom_count=int(self.atom_types.shape[1])
+                ).detach().cpu().tolist()
+                self._max_neighbors_by_atom = [
+                    max(old, new)
+                    for old, new in zip(self._max_neighbors_by_atom or counts, counts)
+                ]
             self.last_edge_count = self._static.copy_schema_(schema)
             self.max_edge_count = max(self.max_edge_count, self.last_edge_count)
             self._assert_static_addresses()
@@ -784,6 +805,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     max_required_neighbors = evaluator.max_required_neighbors
     if max_required_neighbors is not None:
         metadata["graph_max_required_neighbors"] = max_required_neighbors
+        metadata["graph_maximum_neighbors_by_atom"] = evaluator._max_neighbors_by_atom
         metadata["capacity_probe_collect_per_atom"] = True
     if request.config.integrator == "nose_hoover_chain":
         metadata["nose_hoover_chain"] = {

@@ -3,7 +3,7 @@
 The complete unconstrained NVT step is captured: Berendsen or Nose-Hoover
 Chain integration, fixed-candidate PBC neighbour construction, the SeZM
 forward/force path, and the persistent GPU-state update.  Capacity uses
-the eSEN-style uniform per-atom CAP policy.  Real edge counts may vary while
+the eSEN-style per-atom CAP policy.  Real edge counts may vary while
 the edge tensor shape stays fixed; unused slots are masked, non-zero-distance
 self sinks distributed over the atoms.
 
@@ -16,7 +16,7 @@ run must be restarted with a larger ``graph_edge_capacity``.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -44,6 +44,13 @@ from deepmd.md_stages.dpa4.opt1 import (
     _require_raw_pt,
 )
 from md_benchmark.md_route import MDRunRequest, MDRunResult, validate_result
+from md_benchmark.neighbor_utils import (
+    capacities_from_counts,
+    displacement_exceeds_skin,
+    make_slot_layout,
+    normalize_neighbor_capacities,
+    select_skin_candidates,
+)
 from md_benchmark.performance import (
     CudaPhaseProfiler,
     performance_profile_requested,
@@ -105,6 +112,9 @@ class _FixedShapeDPA4NeighborBuilder:
         cell: Tensor,
         cutoff: float,
         neighbors_per_atom: int,
+        neighbor_capacities: list[int] | Tensor | None = None,
+        verlet_skin: float = 0.0,
+        verlet_candidate_capacity: int | None = None,
     ) -> None:
         if num_atoms < 1:
             raise ValueError("DPA4 Opt3 requires at least one atom")
@@ -114,11 +124,37 @@ class _FixedShapeDPA4NeighborBuilder:
             raise ValueError("DPA4 Opt3 neighbors_per_atom must be positive")
         self.num_atoms = int(num_atoms)
         self.cutoff = float(cutoff)
-        self.neighbors_per_atom = int(neighbors_per_atom)
+        capacities = normalize_neighbor_capacities(
+            neighbor_capacities,
+            num_atoms=num_atoms,
+            default=int(neighbors_per_atom),
+        )
+        (
+            self.slot_centres,
+            self.slot_ranks,
+            self.selection_indices,
+            self.neighbors_per_atom,
+            self.edge_capacity,
+        ) = make_slot_layout(capacities, device=cell.device)
+        self.neighbor_capacities = torch.as_tensor(
+            capacities, dtype=torch.long, device=cell.device
+        )
+        if verlet_skin < 0:
+            raise ValueError("verlet_skin must be non-negative")
+        self.verlet_skin = float(verlet_skin)
+        self.verlet_candidate_capacity = verlet_candidate_capacity
+        self.skin_candidate_ids: Tensor | None = None
+        self.skin_candidate_mask: Tensor | None = None
+        self.skin_reference_positions: Tensor | None = None
+        self.skin_reference_images: Tensor | None = None
+        self.skin_misses = torch.zeros((), dtype=torch.long, device=cell.device)
+        self.skin_rebuilds = 0
         self.device = cell.device
         self.cell = cell.detach().reshape(3, 3).contiguous()
         self.inverse_cell = torch.linalg.inv(self.cell).contiguous()
-        self.repetitions = _pbc_repetitions(self.cell, self.cutoff)
+        self.repetitions = _pbc_repetitions(
+            self.cell, self.cutoff + self.verlet_skin
+        )
         axes = [
             torch.arange(
                 -repeat,
@@ -146,6 +182,52 @@ class _FixedShapeDPA4NeighborBuilder:
             self.num_atoms, dtype=torch.long, device=self.device
         ).reshape(-1, 1)
 
+    @torch.no_grad()
+    def initialize_skin(self, positions: Tensor) -> None:
+        if self.verlet_skin <= 0:
+            return
+        fractional = torch.mm(positions, self.inverse_cell)
+        reference_images = torch.floor(fractional)
+        candidate_positions = torch.mm(
+            torch.remainder(fractional, 1.0), self.cell
+        )
+        requested = self.verlet_candidate_capacity
+        slots = max(self.neighbors_per_atom, int(requested)) if requested is not None else max(
+            self.neighbors_per_atom * 2, self.neighbors_per_atom + 32
+        )
+        slots = min(slots, self.candidates_per_atom)
+        selected, counts, selected_valid = select_skin_candidates(
+            candidate_positions,
+            self.candidate_sources,
+            self.candidate_shifts,
+            self.cell,
+            cutoff=self.cutoff + self.verlet_skin,
+            slots_per_atom=slots,
+            min_distance_sqr=1.0e-10,
+        )
+        torch._assert_async(
+            (counts <= slots).all(),
+            "DPA4 Opt3 Verlet candidate capacity is smaller than the "
+            "cutoff+skin candidate count",
+        )
+        if self.skin_candidate_ids is None:
+            self.skin_candidate_ids = selected
+            self.skin_candidate_mask = selected_valid
+            self.skin_reference_positions = positions.detach().clone()
+            self.skin_reference_images = reference_images.detach().clone()
+        else:
+            if self.skin_candidate_ids.shape != selected.shape:
+                raise RuntimeError("Verlet candidate shape changed during rebuild")
+            self.skin_candidate_ids.copy_(selected)
+            assert self.skin_candidate_mask is not None
+            self.skin_candidate_mask.copy_(selected_valid)
+            assert self.skin_reference_positions is not None
+            self.skin_reference_positions.copy_(positions)
+            assert self.skin_reference_images is not None
+            self.skin_reference_images.copy_(reference_images)
+        self.verlet_candidate_capacity = slots
+        self.skin_rebuilds += 1
+
     def build(
         self, positions: Tensor
     ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -155,20 +237,71 @@ class _FixedShapeDPA4NeighborBuilder:
         fractional = torch.mm(positions, self.inverse_cell)
         wrapped = torch.mm(torch.remainder(fractional, 1.0), self.cell)
         # Use wrapped coordinates consistently for both centres and images.
-        shifted_sources = wrapped.index_select(0, self.candidate_sources) + torch.mm(
-            self.candidate_shifts.to(dtype=positions.dtype), self.cell
-        )
-        vectors = shifted_sources.unsqueeze(0) - wrapped.unsqueeze(1)
+        if self.skin_candidate_ids is not None:
+            assert self.skin_reference_positions is not None
+            assert self.skin_reference_images is not None
+            assert self.skin_candidate_mask is not None
+            skin_miss = displacement_exceeds_skin(
+                positions,
+                self.skin_reference_positions,
+                self.verlet_skin,
+                self.cell,
+                inverse_cell=self.inverse_cell,
+            )
+            self.skin_misses.add_(skin_miss.to(torch.long))
+            torch._assert_async(
+                ~skin_miss,
+                "DPA4 Opt3 Verlet skin exhausted; rebuild the candidate list",
+            )
+            cached = self.skin_candidate_ids.reshape(-1)
+            candidate_sources = self.candidate_sources.index_select(0, cached).reshape(
+                self.num_atoms, -1
+            )
+            candidate_shifts = self.candidate_shifts.index_select(0, cached).reshape(
+                self.num_atoms, -1, 3
+            )
+            image_delta = torch.floor(fractional) - self.skin_reference_images
+            candidate_shifts = (
+                candidate_shifts
+                + image_delta.index_select(
+                    0, candidate_sources.reshape(-1)
+                ).reshape(self.num_atoms, -1, 3)
+                - image_delta.unsqueeze(1)
+            )
+            candidate_width = int(candidate_sources.shape[1])
+            candidates = torch.arange(
+                candidate_width, dtype=torch.long, device=self.device
+            ).reshape(1, -1).expand(self.num_atoms, -1)
+            shifted_sources = wrapped.index_select(
+                0, candidate_sources.reshape(-1)
+            ).reshape(self.num_atoms, candidate_width, 3) + torch.mm(
+                candidate_shifts.reshape(-1, 3).to(dtype=positions.dtype), self.cell
+            ).reshape(self.num_atoms, candidate_width, 3)
+            vectors = shifted_sources - wrapped.unsqueeze(1)
+            valid_candidates = self.skin_candidate_mask
+        else:
+            shifted_sources = wrapped.index_select(0, self.candidate_sources) + torch.mm(
+                self.candidate_shifts.to(dtype=positions.dtype), self.cell
+            )
+            candidates = self.candidate_ids.expand(self.num_atoms, -1)
+            candidate_sources = self.candidate_sources.reshape(1, -1).expand(
+                self.num_atoms, -1
+            )
+            candidate_shifts = self.candidate_shifts.reshape(1, -1, 3).expand(
+                self.num_atoms, -1, -1
+            )
+            vectors = shifted_sources.unsqueeze(0) - wrapped.unsqueeze(1)
+            valid_candidates = torch.ones_like(candidates, dtype=torch.bool)
+        candidate_sentinel = int(candidates.shape[1])
         distance_sqr = vectors.square().sum(dim=-1)
-        valid = (distance_sqr <= self.cutoff * self.cutoff) & (
+        valid = valid_candidates & (distance_sqr <= self.cutoff * self.cutoff) & (
             distance_sqr > 1.0e-10
         )
         counts = valid.sum(dim=1)
-        candidates = self.candidate_ids.expand(self.num_atoms, -1)
         ordered = torch.where(
             valid,
             candidates,
-            torch.full_like(candidates, self.candidates_per_atom),
+            torch.full_like(candidates, candidate_sentinel),
         )
         selected = torch.topk(
             ordered,
@@ -177,13 +310,11 @@ class _FixedShapeDPA4NeighborBuilder:
             largest=False,
             sorted=True,
         ).values
-        selected_valid = selected < self.candidates_per_atom
-        safe = selected.clamp_max(self.candidates_per_atom - 1)
-        sources = self.candidate_sources.index_select(0, safe.reshape(-1)).reshape(
-            self.num_atoms, self.neighbors_per_atom
-        )
-        shifts = self.candidate_shifts.index_select(0, safe.reshape(-1)).reshape(
-            self.num_atoms, self.neighbors_per_atom, 3
+        selected_valid = selected < candidate_sentinel
+        safe = selected.clamp_max(candidate_sentinel - 1)
+        sources = torch.gather(candidate_sources, 1, safe)
+        shifts = torch.gather(
+            candidate_shifts, 1, safe.unsqueeze(-1).expand(-1, -1, 3)
         )
         sources = torch.where(selected_valid, sources, self.centres)
         shifts = torch.where(
@@ -297,6 +428,10 @@ def _fixed_edge_schema_from_neighbor_matrix(
     shifts: Tensor,
     rcut: float,
     edge_capacity: int,
+    neighbor_capacities: list[int] | Tensor | None = None,
+    _slot_centres: Tensor | None = None,
+    _selection_indices: Tensor | None = None,
+    _neighbor_capacities_tensor: Tensor | None = None,
 ) -> EdgeNeighborList:
     """Create a fixed edge axis with distributed, masked self-sink padding.
 
@@ -316,22 +451,57 @@ def _fixed_edge_schema_from_neighbor_matrix(
             "neighbor matrix atom dimension does not match the MD frame: "
             f"{total_atoms} != {nloc}"
         )
-    candidate_slots = total_atoms * slots_per_atom
-    if edge_capacity < candidate_slots:
+    if (
+        _slot_centres is None
+        or _selection_indices is None
+        or _neighbor_capacities_tensor is None
+    ):
+        capacities = normalize_neighbor_capacities(
+            neighbor_capacities,
+            num_atoms=total_atoms,
+            default=slots_per_atom,
+        )
+        (
+            slot_centres,
+            _slot_ranks,
+            selection_indices,
+            max_slots,
+            expected_capacity,
+        ) = make_slot_layout(capacities, device=coord.device)
+        capacities_tensor = torch.as_tensor(
+            capacities, dtype=torch.long, device=coord.device
+        )
+    else:
+        slot_centres = _slot_centres
+        selection_indices = _selection_indices
+        capacities_tensor = _neighbor_capacities_tensor
+        max_slots = slots_per_atom
+        expected_capacity = int(slot_centres.numel())
+    if max_slots != slots_per_atom:
+        raise ValueError("neighbor matrix width must equal max capacity")
+    if edge_capacity < expected_capacity:
         raise ValueError(
-            "graph edge capacity is smaller than fixed neighbor slots: "
-            f"{edge_capacity} < {candidate_slots}"
+            "graph edge capacity is smaller than per-atom capacities: "
+            f"{edge_capacity} < {expected_capacity}"
         )
 
     device = coord.device
-    slot = torch.arange(slots_per_atom, dtype=torch.long, device=device)
-    slot = slot.expand(total_atoms, slots_per_atom)
-    dst = torch.arange(total_atoms, dtype=torch.long, device=device)
-    dst = dst.unsqueeze(1).expand(-1, slots_per_atom).reshape(-1)
-    valid_search = (slot < num_neighbors.reshape(-1, 1)).reshape(-1)
-    src_raw = neighbor_matrix.reshape(-1).to(dtype=torch.long)
+    dst = slot_centres
+    valid_search_matrix = torch.arange(
+        slots_per_atom, dtype=torch.long, device=device
+    ).reshape(1, -1) < num_neighbors.reshape(-1, 1)
+    valid_search_matrix = valid_search_matrix & (
+        torch.arange(slots_per_atom, dtype=torch.long, device=device).reshape(1, -1)
+        < capacities_tensor.reshape(-1, 1)
+    )
+    valid_search = valid_search_matrix.reshape(-1).index_select(0, selection_indices)
+    src_raw = neighbor_matrix.reshape(-1).to(dtype=torch.long).index_select(
+        0, selection_indices
+    )
     src = torch.where(valid_search, src_raw, dst)
-    shift = shifts.reshape(-1, 3).to(dtype=coord.dtype)
+    shift = shifts.reshape(-1, 3).to(dtype=coord.dtype).index_select(
+        0, selection_indices
+    )
     shift = torch.where(valid_search.unsqueeze(1), shift, torch.zeros_like(shift))
 
     coord_flat = coord.reshape(total_atoms, 3)
@@ -353,7 +523,7 @@ def _fixed_edge_schema_from_neighbor_matrix(
     safe_src = torch.where(edge_mask, src, sink)
     safe_vec = torch.where(edge_mask.unsqueeze(1), edge_vec, far_vec)
 
-    tail = edge_capacity - candidate_slots
+    tail = edge_capacity - expected_capacity
     if tail:
         tail_sink = torch.remainder(
             torch.arange(tail, dtype=torch.long, device=device), nloc
@@ -463,12 +633,52 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             explicit_edge_capacity=graph_edge_capacity,
             explicit_search_capacity=neighbor_search_capacity,
         )
+        explicit_caps = request.options.get("neighbor_capacities")
+        if explicit_caps is None and request.options.get("per_atom_cap", False):
+            self.neighbor_capacities = capacities_from_counts(
+                initial_num_neighbors,
+                factor=float(graph_edge_capacity_factor),
+                headroom=int(graph_edge_capacity_headroom),
+                alignment=int(graph_edge_capacity_alignment),
+            )
+        else:
+            self.neighbor_capacities = normalize_neighbor_capacities(
+                explicit_caps,
+                num_atoms=n_atoms,
+                default=self.capacity_plan.neighbors_per_atom,
+            )
+        self.capacity_plan = replace(
+            self.capacity_plan,
+            edge_capacity=int(sum(self.neighbor_capacities)),
+            neighbors_per_atom=max(self.neighbor_capacities),
+            candidate_slots=n_atoms * max(self.neighbor_capacities),
+            source=(
+                "explicit-per-atom-vector"
+                if len(set(self.neighbor_capacities)) > 1
+                else (
+                    "initial-per-atom-cap-vector"
+                    if explicit_caps is None and request.options.get("per_atom_cap", False)
+                    else self.capacity_plan.source
+                )
+            ),
+        )
         self._fixed_builder = _FixedShapeDPA4NeighborBuilder(
             num_atoms=n_atoms,
             cell=self.cell[0],
             cutoff=float(self._model.get_rcut()),
             neighbors_per_atom=self.capacity_plan.neighbors_per_atom,
+            neighbor_capacities=self.neighbor_capacities,
+            verlet_skin=float(request.options.get("verlet_skin", 0.0)),
+            verlet_candidate_capacity=request.options.get("verlet_candidate_capacity"),
         )
+        self._fixed_builder.initialize_skin(initial_model_positions[0])
+        self.verlet_rebuild_interval = int(
+            request.options.get("verlet_rebuild_interval", 0)
+        )
+        if self.verlet_rebuild_interval < 0:
+            raise ValueError("verlet_rebuild_interval must be non-negative")
+        if self._fixed_builder.verlet_skin <= 0:
+            self.verlet_rebuild_interval = 0
         _, _, fixed_initial_counts, _ = self._fixed_builder.build(
             initial_model_positions[0]
         )
@@ -478,6 +688,18 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
                 "DPA4 Opt3 fixed candidate builder disagrees with the setup "
                 f"nvalchemiops probe: {fixed_initial_max} != "
                 f"{initial_max_neighbors}"
+            )
+        fixed_initial_excess = torch.clamp_min(
+            fixed_initial_counts
+            - torch.as_tensor(
+                self.neighbor_capacities, dtype=torch.long, device=self.device
+            ),
+            0,
+        )
+        if bool(fixed_initial_excess.max().item() > 0):
+            raise RuntimeError(
+                "DPA4 Opt3 per-atom capacity vector is smaller than the "
+                "initial graph"
             )
         self.neighbor_shape_metadata = {
             "initial_max_neighbors": initial_max_neighbors,
@@ -497,6 +719,11 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             initial_max_neighbors, dtype=torch.int64, device=self.device
         )
         self._max_required_neighbors = self._last_required_neighbors.clone()
+        self._max_required_neighbors_by_atom = torch.full(
+            (n_atoms,), 0, dtype=torch.int64, device=self.device
+        )
+        self._max_required_neighbors_by_atom.copy_(fixed_initial_counts.to(torch.int64))
+        self._initial_neighbors_by_atom = fixed_initial_counts.to(torch.int64).clone()
         self._overflow_flag = torch.zeros(
             (), dtype=torch.bool, device=self.device
         )
@@ -566,10 +793,23 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             positions.to(dtype=self.model_dtype)
         )
         required = num_neighbors.max().to(dtype=torch.int64)
-        overflow = required > self.capacity_plan.neighbors_per_atom
+        overflow_by_atom = torch.clamp_min(
+            num_neighbors
+            - torch.as_tensor(
+                self.neighbor_capacities, dtype=torch.long, device=self.device
+            ),
+            0,
+        )
+        overflow = overflow_by_atom.max() > 0
         self._last_required_neighbors.copy_(required)
         self._max_required_neighbors.copy_(
             torch.maximum(self._max_required_neighbors, required)
+        )
+        self._max_required_neighbors_by_atom.copy_(
+            torch.maximum(
+                self._max_required_neighbors_by_atom,
+                num_neighbors.to(dtype=torch.int64),
+            )
         )
         self._overflow_flag.logical_or_(overflow)
         self._overflow_count.add_(overflow.to(dtype=torch.int64))
@@ -590,6 +830,12 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             shifts=shifts,
             rcut=float(self._model.get_rcut()),
             edge_capacity=self.capacity_plan.edge_capacity,
+            neighbor_capacities=self.neighbor_capacities,
+            _slot_centres=self._fixed_builder.slot_centres,
+            _selection_indices=self._fixed_builder.selection_indices,
+            _neighbor_capacities_tensor=(
+                self._fixed_builder.neighbor_capacities
+            ),
         )
 
     def _run_model(self, schema: EdgeNeighborList) -> tuple[Tensor, Tensor, Tensor]:
@@ -684,6 +930,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             int(self.neighbor_shape_metadata["initial_max_neighbors"])
         )
         self._max_required_neighbors.copy_(self._last_required_neighbors)
+        self._max_required_neighbors_by_atom.copy_(self._initial_neighbors_by_atom)
         self._overflow_flag.zero_()
         self._overflow_count.zero_()
         if isinstance(self._integrator, GPUNoseHooverChain):
@@ -815,6 +1062,13 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         """Replay one captured step; evaluator is intentionally unused."""
         if state is not self.state or evaluator is not self:
             raise RuntimeError("DPA4 Opt3 requires its persistent state/evaluator")
+        if (
+            self.verlet_rebuild_interval
+            and (self.production_replays + 1) % self.verlet_rebuild_interval == 0
+        ):
+            self._fixed_builder.initialize_skin(
+                state.positions.to(dtype=self.model_dtype)
+            )
         self._graph.replay()
         self.production_replays += 1
 
@@ -960,6 +1214,11 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     torch.cuda.synchronize(device)
     runner.restore_initial_()
     runner.production_replays = 0
+    runner._fixed_builder.skin_misses.zero_()
+    runner._fixed_builder.skin_rebuilds = 0
+    runner._fixed_builder.initialize_skin(
+        runner.state.positions.to(dtype=runner.model_dtype)
+    )
 
     elapsed, observations, trajectory, trajectory_path = _run_measured_loop(
         request,
@@ -1006,11 +1265,47 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             runner.capacity_plan.total_edge_derived_neighbors
         ),
         "graph_max_required_neighbors": runner.max_required_neighbors,
+        "graph_maximum_neighbors_by_atom": runner._max_required_neighbors_by_atom.detach()
+        .to(device="cpu")
+        .tolist(),
         "graph_overflow_count": runner.overflow_count,
         "graph_initial_edge_count": runner.initial_edge_count,
         "graph_final_edge_count": runner.last_edge_count,
         "graph_max_edge_count": runner.max_edge_count,
-        "graph_capacity_policy": "esen-cap-uniform-per-atom-single-graph",
+        "graph_capacity_policy": (
+            "esen-cap-per-atom-single-graph"
+            if len(set(runner.neighbor_capacities)) > 1
+            else "esen-cap-uniform-per-atom-single-graph"
+        ),
+        "neighbor_capacities": runner.neighbor_capacities,
+        "verlet_skin": runner._fixed_builder.verlet_skin,
+        "verlet_candidate_capacity": runner._fixed_builder.verlet_candidate_capacity,
+        "verlet_skin_misses": int(runner._fixed_builder.skin_misses.item()),
+        "verlet_rebuild_interval": runner.verlet_rebuild_interval,
+        "verlet_rebuild_count": runner._fixed_builder.skin_rebuilds,
+        "fixed_builder_verlet_candidate_capacity": (
+            runner._fixed_builder.verlet_candidate_capacity
+        ),
+        "fixed_builder_verlet_rebuilds": runner._fixed_builder.skin_rebuilds,
+        "fixed_builder_candidate_universe_size": (
+            runner._fixed_builder.num_atoms
+            * runner._fixed_builder.candidates_per_atom
+        ),
+        "fixed_builder_active_candidate_slots": (
+            runner._fixed_builder.num_atoms
+            * (
+                int(runner._fixed_builder.skin_candidate_ids.shape[1])
+                if runner._fixed_builder.skin_candidate_ids is not None
+                else runner._fixed_builder.candidates_per_atom
+            )
+        ),
+        "fixed_builder_candidate_reduction_fraction": (
+            0.0
+            if runner._fixed_builder.skin_candidate_ids is None
+            else 1.0
+            - int(runner._fixed_builder.skin_candidate_ids.shape[1])
+            / runner._fixed_builder.candidates_per_atom
+        ),
         "graph_capacity_guard_neighbors": max(
             0,
             runner.capacity_plan.neighbors_per_atom
