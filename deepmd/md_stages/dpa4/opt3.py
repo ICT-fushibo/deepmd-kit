@@ -27,6 +27,24 @@ from torch import Tensor  # noqa: TID253
 if TYPE_CHECKING:
     from pathlib import Path
 
+from md_benchmark.md_route import MDRunRequest, MDRunResult, validate_result
+from md_benchmark.neighbor_utils import (
+    capacities_from_counts,
+    displacement_exceeds_skin,
+    make_slot_layout,
+    normalize_neighbor_capacities,
+    select_skin_candidates,
+)
+from md_benchmark.opt3_profile import (
+    model_nvtx_ranges,
+    nvtx_stage,
+    profile_opt3,
+)
+from md_benchmark.performance import (
+    CudaPhaseProfiler,
+    performance_profile_requested,
+)
+
 from deepmd.dpmodel.utils.neighbor_list import EdgeNeighborList
 from deepmd.md_stages.dpa3.opt1 import (
     GPUMDState,
@@ -37,25 +55,12 @@ from deepmd.md_stages.dpa3.opt1 import (
     _state_to_atoms,
 )
 from deepmd.md_stages.dpa4.opt1 import (
-    DPA4EnergyForceEvaluator,
     _DEEPMD_OPT1_ENV,
+    DPA4EnergyForceEvaluator,
     _configure_opt1,
     _evaluator_metadata,
     _require_raw_pt,
 )
-from md_benchmark.md_route import MDRunRequest, MDRunResult, validate_result
-from md_benchmark.neighbor_utils import (
-    capacities_from_counts,
-    displacement_exceeds_skin,
-    make_slot_layout,
-    normalize_neighbor_capacities,
-    select_skin_candidates,
-)
-from md_benchmark.performance import (
-    CudaPhaseProfiler,
-    performance_profile_requested,
-)
-
 
 _CANONICAL_BACKEND = "whole-step-cuda-graph"
 
@@ -792,6 +797,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             tensors.extend((self._integrator.eta, self._integrator.p_eta))
         return tuple(tensor.data_ptr() for tensor in tensors)
 
+    @nvtx_stage("neighbor_geometry")
     def _build_fixed_edge_schema(self, positions: Tensor) -> EdgeNeighborList:
         coord, neighbor_matrix, num_neighbors, shifts = self._fixed_builder.build(
             positions.to(dtype=self.model_dtype)
@@ -841,7 +847,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         )
 
     def _run_model(self, schema: EdgeNeighborList) -> tuple[Tensor, Tensor, Tensor]:
-        with torch.enable_grad():
+        with model_nvtx_ranges(self._model), torch.enable_grad():
             output = self._model.forward_lower(
                 schema.coord,
                 schema.atype,
@@ -872,6 +878,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         force, energy, virial = self._run_model(schema)
         return force, energy, virial, schema.edge_mask.sum(dtype=torch.int64)
 
+    @nvtx_stage("integrator_thermostat")
     def _step_body(self) -> None:
         state = self.state
         assert state.forces is not None
@@ -1101,6 +1108,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             )
 
 
+@profile_opt3
 def run_md(request: MDRunRequest) -> MDRunResult:
     """Run DPA4 whole-step CUDA Graph MD with strict capacity errors."""
     if request.model != "dpa4" or request.stage != "opt3":
@@ -1150,6 +1158,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     profiler = CudaPhaseProfiler(
         enabled=performance_profile_requested(request.options),
         device=device,
+        prefix="opt3",
     )
     configured_edge_capacity = request.options.get("graph_edge_capacity")
     configured_capacity_alignment = int(

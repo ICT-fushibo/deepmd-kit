@@ -22,8 +22,6 @@ import torch
 from ase import Atoms, units
 from ase.calculators.singlepoint import SinglePointCalculator
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
-from torch import Tensor
-
 from md_benchmark.md_route import (
     MDObservation,
     MDRunRequest,
@@ -31,11 +29,12 @@ from md_benchmark.md_route import (
     configure_torch_baseline,
     validate_result,
 )
+from md_benchmark.opt3_profile import nvtx_steps
 from md_benchmark.performance import (
     CudaPhaseProfiler,
     performance_profile_requested,
 )
-
+from torch import Tensor
 
 _DEEPMD_OPT1_ENV = {
     "DP_ACT_INFER": "0",
@@ -597,7 +596,7 @@ def _run_measured_loop(
     if config.collect_statistics and 0 in observation_steps:
         observations.append(_observation(0, state, masses))
 
-    for step in range(1, config.steps + 1):
+    for step in nvtx_steps(config.steps, evaluator.device):
         if profiler is None:
             integrator.step(state, evaluator)
         else:
