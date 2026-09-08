@@ -1993,7 +1993,11 @@ class SO2Convolution(nn.Module):
             with nvtx_range("SO2Conv/rotate_to_local"):
                 D_full = edge_cache.D_full
                 x_dst_local: torch.Tensor | None = None
-                if self.use_triton_infer and not self.training:
+                if hasattr(self, "_opt4_rotation_to"):
+                    x_local = self._opt4_rotation_to(x, src, D_full)
+                    if self.node_wise_grid_product is not None:
+                        x_dst_local = self._opt4_rotation_to(x, dst, D_full)
+                elif self.use_triton_infer and not self.training:
                     # ``self._rotate_to_local_fn`` was bound in ``__init__`` (the
                     # block kernel for the m-major ``mmax == 1`` layout, dense
                     # otherwise).
@@ -2025,7 +2029,8 @@ class SO2Convolution(nn.Module):
                 if self.radial_hidden_proj is not None:
                     rad_feat = self.radial_hidden_proj(rad_feat)
                 if self.radial_degree_mixer is None:
-                    x_local.mul_(rad_feat)
+                    if not getattr(self, "_opt4_epilogue", False):
+                        x_local.mul_(rad_feat)
                 else:
                     x_local = self.radial_degree_mixer(x_local, rad_feat)
                 if self.node_wise_grid_product is not None:
@@ -2046,9 +2051,12 @@ class SO2Convolution(nn.Module):
             # view would be.
             focus_gate_src: torch.Tensor | None = None
             with nvtx_range("SO2Conv/reshape_for_so2"):
-                x_local = x_local.reshape(
-                    n_edge, self.reduced_dim, self.n_focus, self.so2_focus_dim
-                ).permute(2, 0, 1, 3)  # (F, E, D_m, Cf), strided view
+                if getattr(self, "_opt4_epilogue", False):
+                    x_local = self._opt4_focus_op(x_local, rad_feat, self.n_focus)
+                else:
+                    x_local = x_local.reshape(
+                        n_edge, self.reduced_dim, self.n_focus, self.so2_focus_dim
+                    ).permute(2, 0, 1, 3)  # (F, E, D_m, Cf), strided view
                 if self.focus_compete and self.n_focus > 1:
                     focus_gate_src = x_local[:, :, 0, :]  # (F, E, Cf)
 
@@ -2081,10 +2089,15 @@ class SO2Convolution(nn.Module):
                     # edge axis, applied to the l=0 scalar slice (F, E, Cout).
                     bias0 = so2_linear.bias0.view(self.n_focus, so2_linear.out_channels)
                     radial_factor = radial_factor.transpose(0, 1)  # (F, E, .)
-                    bias_correction = bias0.unsqueeze(1) * (
-                        radial_factor * edge_cache.edge_env.reshape(1, -1, 1) - 1.0
-                    )
-                    x_local[:, :, 0, :].add_(bias_correction)
+                    if getattr(self, "_opt4_epilogue", False):
+                        from md_benchmark.opt4_ops import mul_add
+                        factor = mul_add(radial_factor, edge_cache.edge_env.reshape(1, -1, 1), self._opt4_minus_one)
+                        x_local[:, :, 0, :] = mul_add(bias0.unsqueeze(1), factor, x_local[:, :, 0, :])
+                    else:
+                        bias_correction = bias0.unsqueeze(1) * (
+                            radial_factor * edge_cache.edge_env.reshape(1, -1, 1) - 1.0
+                        )
+                        x_local[:, :, 0, :].add_(bias_correction)
 
                 if self.use_so2_attn_res:
                     # The depth-attention residual is a per-edge reduction over the
@@ -2117,7 +2130,11 @@ class SO2Convolution(nn.Module):
                             scale: torch.Tensor = self.adam_so2_layer_scales[
                                 layer_idx
                             ].reshape(self.n_focus, 1, 1, self.so2_focus_dim)
-                            x_local = residual + scale * x_local
+                            if getattr(self, "_opt4_epilogue", False):
+                                from md_benchmark.opt4_ops import mul_add
+                                x_local = mul_add(scale, x_local, residual)
+                            else:
+                                x_local = residual + scale * x_local
                         else:
                             x_local = residual + x_local
                         so2_depth_sources.append((x_local - residual).transpose(0, 1))
@@ -2141,7 +2158,11 @@ class SO2Convolution(nn.Module):
                             scale = self.adam_so2_layer_scales[layer_idx].reshape(
                                 self.n_focus, 1, 1, self.so2_focus_dim
                             )
-                            x_local = residual + scale * x_local
+                            if getattr(self, "_opt4_epilogue", False):
+                                from md_benchmark.opt4_ops import mul_add
+                                x_local = mul_add(scale, x_local, residual)
+                            else:
+                                x_local = residual + scale * x_local
                         else:
                             x_local = residual + x_local
 
@@ -2171,7 +2192,9 @@ class SO2Convolution(nn.Module):
         # === Step 6. Rotate back to global frame ===
         with nvtx_range("SO2Conv/rotate_back"):
             Dt_full = edge_cache.Dt_full
-            if self.use_triton_infer and self.mmax == 1 and not self.training:
+            if hasattr(self, "_opt4_rotation_back"):
+                x_message = self._opt4_rotation_back(x_local, Dt_full)
+            elif self.use_triton_infer and self.mmax == 1 and not self.training:
                 # The block kernel consumes the (E, F, D_m, Cf) focus layout in
                 # place, folding the inverse transpose into its channel addressing.
                 x_message = self._rotate_back_fn(x_local, Dt_full)  # (E, D, C_wide)

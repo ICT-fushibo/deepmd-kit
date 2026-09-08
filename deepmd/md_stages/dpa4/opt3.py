@@ -586,6 +586,10 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         )
         if capture_warmup_replays < 1:
             raise ValueError("cuda_graph_capture_warmup_replays must be positive")
+        if request.options.get("_opt4_passes"):
+            from md_benchmark.opt4_registry import prepare_model
+            from .opt4_fusion import install
+            prepare_model(self._model, request.options, install)
         if min(
             validation_state_atol,
             validation_force_atol,
