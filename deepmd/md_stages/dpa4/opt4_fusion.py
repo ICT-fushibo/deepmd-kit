@@ -19,10 +19,10 @@ class Rotation(nn.Module):
 
     def forward(self, x, index_or_wigner, wigner=None):
         if self.fused:
-            from deepmd.kernels.triton.sezm.so2_rotation import rotate_to_local_block, rotate_back_block_so2
+            from .opt4_rotation import rotation
             if self.back:
-                return rotate_back_block_so2(x, index_or_wigner, self.lmax)
-            return rotate_to_local_block(x, index_or_wigner, wigner, self.lmax)
+                return rotation(x, self.indices, index_or_wigner, self.indices, self.degree_mask, self.lmax, True)
+            return rotation(x, index_or_wigner, wigner, self.indices, self.degree_mask, self.lmax, False)
         if self.back:
             matrix = (index_or_wigner[:, :self.dim, :self.dim] * self.degree_mask).index_select(2, self.indices)
             return torch.bmm(matrix, x.transpose(1, 2).reshape(x.shape[0], x.shape[2], -1))
@@ -62,4 +62,6 @@ def install(model, passes, report):
             details["so2_epilogue"].append({"module": path, "boundaries": ["radial-focus-pack", "bias-correction", "scaled-residual"], "gates": gates,"pack":pack_detail})
     for p, modules in details.items():
         record(report, p, len(modules), "triton-ieee-autograd", modules=modules,
-               precision="checkpoint dtype unchanged; rotation requires FP32 and mmax=1", gemm="SO2Linear unchanged")
+               precision="checkpoint dtype unchanged; rotation requires FP32 and mmax=1", gemm="SO2Linear unchanged",
+               fusion_scope="forward-only" if p == "so2_rotation" else "forward-and-backward",
+               backward_policy="native-bmm-index-select-vjp" if p == "so2_rotation" else "compiled")
