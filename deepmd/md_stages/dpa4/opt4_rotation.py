@@ -2,7 +2,7 @@
 
 The general SeZM Triton switches and their backward kernels are not changed.
 Float32 edge-atomic reduction had failed the frozen full-checkpoint VJP gate;
-retain bmm + index_select_backward for that reduction, without widening dtype.
+retain bmm and native sorted indexed accumulation, without widening dtype.
 """
 from typing import Tuple
 
@@ -51,9 +51,11 @@ def rotation_vjp(g: Tensor, x: Tensor, index: Tensor, wigner: Tensor, indices: T
     else:
         rows = matrix.index_select(1, indices)
         gx_edge = torch.bmm(rows.transpose(1, 2), g)
-        # Same ATen primitive as the original index_select autograd, reading
-        # CURRENT GPU endpoints. Never cache a setup-time edge permutation.
-        gx = torch.ops.aten.index_select_backward.default(gx_edge, list(x.shape), 0, index)
+        # CUDA index_add uses unordered floating atomicAdd; even reference vs
+        # reference can differ near cancellation. Native index_put(accumulate)
+        # uses its sorted path on CUDA. Read CURRENT indices on every replay.
+        gx = torch.zeros(x.shape, device=x.device, dtype=x.dtype)
+        gx.index_put_((index,), gx_edge, accumulate=True)
         gw_reduced = torch.bmm(g, x.index_select(0, index).transpose(1, 2))
         gw_full = torch.index_add(torch.zeros_like(matrix), 1, indices, gw_reduced)
     gw = torch.zeros_like(wigner)

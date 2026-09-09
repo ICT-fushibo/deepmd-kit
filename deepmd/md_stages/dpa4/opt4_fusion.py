@@ -40,10 +40,13 @@ def install(model, passes, report):
         if module.training or module.use_triton_infer or module.use_cute_infer:
             raise FusionSetupError("Opt4 requires an eager eval SeZM checkpoint with global acceleration disabled")
         if "so2_rotation" in passes and module.mmax == 1 and module.compute_dtype == torch.float32:
+            from .opt4_validation import RotationVJPComparison
             if not hasattr(torch.library, "triton_op"):
                 raise FusionSetupError("this installed PyTorch lacks torch.library.triton_op")
             detail = {"module": path, "forward": {"benchmark_requested":report.get("benchmark_boundaries",False)}, "back": {"benchmark_requested":report.get("benchmark_boundaries",False)}}
-            module._opt4_rotation_to = CheckedRegion(Rotation(module), detail["forward"], Rotation(module, fused=True))
+            detail["forward"]["validation_reduction"] = "shared-native-index-put-accumulate; original float tolerances"
+            module._opt4_rotation_to = CheckedRegion(Rotation(module), detail["forward"], Rotation(module, fused=True),
+                                                    validation_context=RotationVJPComparison)
             module._opt4_rotation_back = CheckedRegion(Rotation(module, back=True), detail["back"], Rotation(module, back=True, fused=True))
             details["so2_rotation"].append(detail)
         if "so2_epilogue" in passes and module.radial_degree_mixer is None and module.node_wise_grid_product is None:
@@ -64,4 +67,4 @@ def install(model, passes, report):
         record(report, p, len(modules), "triton-ieee-autograd", modules=modules,
                precision="checkpoint dtype unchanged; rotation requires FP32 and mmax=1", gemm="SO2Linear unchanged",
                fusion_scope="forward-only" if p == "so2_rotation" else "forward-and-backward",
-               backward_policy="native-bmm-index-select-vjp" if p == "so2_rotation" else "compiled")
+               backward_policy="native-bmm-sorted-index-put-vjp" if p == "so2_rotation" else "compiled")
