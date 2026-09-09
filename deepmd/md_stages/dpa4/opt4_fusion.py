@@ -44,6 +44,8 @@ def install(model, passes, report):
             if not hasattr(torch.library, "triton_op"):
                 raise FusionSetupError("this installed PyTorch lacks torch.library.triton_op")
             detail = {"module": path, "forward": {"benchmark_requested":report.get("benchmark_boundaries",False)}, "back": {"benchmark_requested":report.get("benchmark_boundaries",False)}}
+            detail["back"].update(fused=False, backend="native-bmm",
+                                 reason="block-unrolled rotation_back failed real-checkpoint forward tolerance")
             detail["forward"]["validation_reduction"] = "shared-native-index-put-accumulate; original float tolerances"
             module._opt4_rotation_to = CheckedRegion(Rotation(module), detail["forward"], Rotation(module, fused=True),
                                                     validation_context=RotationVJPComparison)
@@ -67,4 +69,6 @@ def install(model, passes, report):
         record(report, p, len(modules), "triton-ieee-autograd", modules=modules,
                precision="checkpoint dtype unchanged; rotation requires FP32 and mmax=1", gemm="SO2Linear unchanged",
                fusion_scope="forward-only" if p == "so2_rotation" else "forward-and-backward",
+               fused_boundaries=["rotate_to_local"] if p == "so2_rotation" else None,
+               excluded_boundaries=["rotate_back: native-bmm"] if p == "so2_rotation" else [],
                backward_policy="native-bmm-sorted-index-put-vjp" if p == "so2_rotation" else "compiled")

@@ -22,11 +22,13 @@ def rotation_reference(x, index, wigner, indices, mask, back=False):
 @torch.library.custom_op("dpa4_opt4::rotation", mutates_args=())
 def rotation(x: Tensor, index: Tensor, wigner: Tensor, indices: Tensor,
              mask: Tensor, lmax: int, back: bool) -> Tensor:
-    if not x.is_cuda:
+    # The reduced -> global contraction is cancellation-sensitive on real
+    # checkpoint activations. Keep the reference FP32 bmm (including its K
+    # ordering); the block-unrolled Triton sum did not meet the frozen gate.
+    # This is a fixed boundary, NOT a caught validation failure or dtype change.
+    if back or not x.is_cuda:
         return rotation_reference(x, index, wigner, indices, mask, back)
-    from deepmd.kernels.triton.sezm.so2_rotation import rotate_back_block_so2, rotate_to_local_block
-    if back:
-        return rotate_back_block_so2(x, wigner, lmax)
+    from deepmd.kernels.triton.sezm.so2_rotation import rotate_to_local_block
     return rotate_to_local_block(x, index, wigner, lmax)
 
 
