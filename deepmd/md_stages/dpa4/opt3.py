@@ -16,6 +16,8 @@ run must be restarted with a larger ``graph_edge_capacity``.
 from __future__ import annotations
 
 import math
+import os
+import time
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
@@ -40,6 +42,15 @@ from md_benchmark.opt3_profile import (
     nvtx_stage,
     profile_opt3,
 )
+from md_benchmark.cap1_rob1 import (
+    FixedAddressStateSnapshot,
+    Rob1Controller,
+    Rob1WindowStatus,
+    VerletCandidateCapacityError,
+    read_rob1_window_status,
+    transaction_boundaries,
+    verlet_rebuild_due,
+)
 from md_benchmark.performance import (
     CudaPhaseProfiler,
     performance_profile_requested,
@@ -51,6 +62,9 @@ from deepmd.md_stages.dpa3.opt1 import (
     GPUNoseHooverChain,
     GPUVelocityVerletBerendsen,
     _build_integrator,
+    _append_trajectory,
+    _observation,
+    _prepare_trajectory,
     _run_measured_loop,
     _state_to_atoms,
 )
@@ -120,6 +134,7 @@ class _FixedShapeDPA4NeighborBuilder:
         neighbor_capacities: list[int] | Tensor | None = None,
         verlet_skin: float = 0.0,
         verlet_candidate_capacity: int | None = None,
+        overflow_to_dummy_only: bool = False,
     ) -> None:
         if num_atoms < 1:
             raise ValueError("DPA4 Opt3 requires at least one atom")
@@ -144,6 +159,7 @@ class _FixedShapeDPA4NeighborBuilder:
         self.neighbor_capacities = torch.as_tensor(
             capacities, dtype=torch.long, device=cell.device
         )
+        self.overflow_to_dummy_only = bool(overflow_to_dummy_only)
         if verlet_skin < 0:
             raise ValueError("verlet_skin must be non-negative")
         self.verlet_skin = float(verlet_skin)
@@ -210,11 +226,11 @@ class _FixedShapeDPA4NeighborBuilder:
             slots_per_atom=slots,
             min_distance_sqr=1.0e-10,
         )
-        torch._assert_async(
-            (counts <= slots).all(),
-            "DPA4 Opt3 Verlet candidate capacity is smaller than the "
-            "cutoff+skin candidate count",
-        )
+        if bool((counts > slots).any().item()):
+            raise VerletCandidateCapacityError(
+                "DPA4 Opt3 Verlet candidate capacity is smaller than the "
+                "cutoff+skin candidate count"
+            )
         if self.skin_candidate_ids is None:
             self.skin_candidate_ids = selected
             self.skin_candidate_mask = selected_valid
@@ -254,10 +270,11 @@ class _FixedShapeDPA4NeighborBuilder:
                 inverse_cell=self.inverse_cell,
             )
             self.skin_misses.add_(skin_miss.to(torch.long))
-            torch._assert_async(
-                ~skin_miss,
-                "DPA4 Opt3 Verlet skin exhausted; rebuild the candidate list",
-            )
+            if not self.overflow_to_dummy_only:
+                torch._assert_async(
+                    ~skin_miss,
+                    "DPA4 Opt3 Verlet skin exhausted; rebuild the candidate list",
+                )
             cached = self.skin_candidate_ids.reshape(-1)
             candidate_sources = self.candidate_sources.index_select(0, cached).reshape(
                 self.num_atoms, -1
@@ -437,6 +454,7 @@ def _fixed_edge_schema_from_neighbor_matrix(
     _slot_centres: Tensor | None = None,
     _selection_indices: Tensor | None = None,
     _neighbor_capacities_tensor: Tensor | None = None,
+    force_dummy_only: Tensor | None = None,
 ) -> EdgeNeighborList:
     """Create a fixed edge axis with distributed, masked self-sink padding.
 
@@ -519,6 +537,8 @@ def _fixed_edge_schema_from_neighbor_matrix(
         & (edge_len2 > 1.0e-10)
         & (edge_len2 <= float(rcut) * float(rcut))
     )
+    if force_dummy_only is not None:
+        edge_mask = edge_mask & ~force_dummy_only
 
     # A finite far vector avoids undefined direction normalization even in
     # implementations that form geometry before applying ``edge_mask``.
@@ -577,16 +597,23 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         validation_virial_atol: float = 1.0e-5,
         validation_thermostat_atol: float = 1.0e-10,
         profiler: CudaPhaseProfiler | None = None,
+        shared_evaluator: DPA4EnergyForceEvaluator | None = None,
     ) -> None:
-        super().__init__(
-            atoms,
-            model_path,
-            device=request.config.device,
-            profiler=profiler,
-        )
+        if shared_evaluator is None:
+            super().__init__(
+                atoms,
+                model_path,
+                device=request.config.device,
+                profiler=profiler,
+            )
+        else:
+            # The model/checkpoint and installed Opt4 adapter outlive graph
+            # generations.  A recovery only replaces fixed-shape buffers and
+            # the captured runner.
+            self.__dict__.update(shared_evaluator.__dict__)
         if capture_warmup_replays < 1:
             raise ValueError("cuda_graph_capture_warmup_replays must be positive")
-        if request.options.get("_opt4_passes"):
+        if shared_evaluator is None and request.options.get("_opt4_passes"):
             from md_benchmark.opt4_registry import prepare_model
             from .opt4_fusion import install
             prepare_model(self._model, request.options, install)
@@ -606,6 +633,9 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         self.state = state
         self.masses = masses.reshape(-1, 1)
         self.request = request
+        self.overflow_to_dummy_only = bool(
+            request.options.get("overflow_to_dummy_only", False)
+        )
         self.validation_tolerances = {
             "positions": float(validation_state_atol),
             "momenta": float(validation_state_atol),
@@ -679,6 +709,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             neighbor_capacities=self.neighbor_capacities,
             verlet_skin=float(request.options.get("verlet_skin", 0.0)),
             verlet_candidate_capacity=request.options.get("verlet_candidate_capacity"),
+            overflow_to_dummy_only=self.overflow_to_dummy_only,
         )
         # Keep the per-atom CAP on the model device.  This tensor is read by
         # the captured builder path; converting the Python list during replay
@@ -743,6 +774,15 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         self._overflow_count = torch.zeros(
             (), dtype=torch.int64, device=self.device
         )
+        self._window_overflow_count = torch.zeros(
+            (), dtype=torch.int64, device=self.device
+        )
+        self._window_dummy_only_replays = torch.zeros(
+            (), dtype=torch.int64, device=self.device
+        )
+        self._window_max_required_neighbors_by_atom = torch.zeros(
+            (n_atoms,), dtype=torch.int64, device=self.device
+        )
 
         initial_force, initial_energy, initial_virial, initial_edge_count = (
             self._evaluate_positions(state.positions)
@@ -768,6 +808,11 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         self.capture_count = 0
         self.validation_replays = 0
         self.production_replays = 0
+        self.step_counter = torch.zeros((), dtype=torch.long, device=self.device)
+        # DPA4 evaluates its initial force eagerly, so ``advance`` remains one
+        # for physical-step graph replays.  It is still part of the ROB1 GPU
+        # snapshot contract, matching the other four whole-step runners.
+        self.advance = torch.ones((), dtype=torch.float64, device=self.device)
         self.validation_completed = False
         self.validation_finite = False
         self.validation_passed = False
@@ -775,9 +820,11 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         self.validation_errors: dict[str, float] = {}
         self.validation_diagnostics: dict[str, dict[str, float | bool]] = {}
         self._state_addresses = self._addresses()
+        capture_started = time.perf_counter()
         with torch.cuda.device(self.device):
             self._graph = torch.cuda.CUDAGraph()
             self._capture_whole_step_graph(int(capture_warmup_replays))
+        self.capture_wall_time_s = time.perf_counter() - capture_started
 
     def _addresses(self) -> tuple[int, ...]:
         state = self.state
@@ -796,6 +843,11 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             self._max_required_neighbors,
             self._overflow_flag,
             self._overflow_count,
+            self._window_overflow_count,
+            self._window_dummy_only_replays,
+            self._window_max_required_neighbors_by_atom,
+            self.step_counter,
+            self.advance,
         ]
         if isinstance(self._integrator, GPUNoseHooverChain):
             tensors.extend((self._integrator.eta, self._integrator.p_eta))
@@ -823,16 +875,26 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
                 num_neighbors.to(dtype=torch.int64),
             )
         )
+        self._window_max_required_neighbors_by_atom.copy_(
+            torch.maximum(
+                self._window_max_required_neighbors_by_atom,
+                num_neighbors.to(dtype=torch.int64),
+            )
+        )
         self._overflow_flag.logical_or_(overflow)
         self._overflow_count.add_(overflow.to(dtype=torch.int64))
+        self._window_overflow_count.add_(overflow.to(dtype=torch.int64))
+        if self.overflow_to_dummy_only:
+            self._window_dummy_only_replays.add_(overflow.to(dtype=torch.int64))
         # The persistent status above makes the requirement visible in metadata
         # and tests; the assertion prevents a truncated replay from ever being
         # accepted as an MD step.
-        torch._assert_async(
-            ~overflow,
-            "DPA4 Opt3 per-atom neighbor capacity exceeded; increase "
-            "graph_edge_capacity or graph_neighbors_per_atom and restart",
-        )
+        if not self.overflow_to_dummy_only:
+            torch._assert_async(
+                ~overflow,
+                "DPA4 Opt3 per-atom neighbor capacity exceeded; increase "
+                "graph_edge_capacity or graph_neighbors_per_atom and restart",
+            )
         return _fixed_edge_schema_from_neighbor_matrix(
             coord=coord,
             atype=self.atom_types,
@@ -848,6 +910,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             _neighbor_capacities_tensor=(
                 self._fixed_builder.neighbor_capacities
             ),
+            force_dummy_only=(overflow if self.overflow_to_dummy_only else None),
         )
 
     def _run_model(self, schema: EdgeNeighborList) -> tuple[Tensor, Tensor, Tensor]:
@@ -926,6 +989,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         state.virial.copy_(virial)
         self._last_edge_count.copy_(edge_count)
         self._max_edge_count.copy_(torch.maximum(self._max_edge_count, edge_count))
+        self.step_counter.add_(1)
 
     def restore_initial_(self) -> None:
         state = self.state
@@ -946,6 +1010,9 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         self._max_required_neighbors_by_atom.copy_(self._initial_neighbors_by_atom)
         self._overflow_flag.zero_()
         self._overflow_count.zero_()
+        self.step_counter.zero_()
+        self.advance.fill_(1.0)
+        self.reset_window_stats()
         if isinstance(self._integrator, GPUNoseHooverChain):
             assert self._initial_eta is not None
             assert self._initial_p_eta is not None
@@ -963,6 +1030,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             "forces": state.forces.clone(),
             "energy": state.potential_energy.clone(),
             "virial": state.virial.clone(),
+            "step_counter": self.step_counter.clone(),
         }
         if isinstance(self._integrator, GPUNoseHooverChain):
             snapshot["eta"] = self._integrator.eta.clone()
@@ -1071,19 +1139,90 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         self._max_edge_count.copy_(torch.maximum(self._max_edge_count, edge_count))
         return state.forces, state.potential_energy, state.virial
 
-    def step(self, state: GPUMDState, evaluator: Any) -> None:
+    def step(
+        self,
+        state: GPUMDState | None = None,
+        evaluator: Any | None = None,
+    ) -> None:
         """Replay one captured step; evaluator is intentionally unused."""
+        state = self.state if state is None else state
+        evaluator = self if evaluator is None else evaluator
         if state is not self.state or evaluator is not self:
             raise RuntimeError("DPA4 Opt3 requires its persistent state/evaluator")
-        if (
-            self.verlet_rebuild_interval
-            and (self.production_replays + 1) % self.verlet_rebuild_interval == 0
-        ):
+        if self.overflow_to_dummy_only:
+            rebuild = verlet_rebuild_due(
+                self.production_replays,
+                self.verlet_rebuild_interval,
+                includes_initial_force=False,
+            )
+        else:
+            rebuild = bool(
+                self.verlet_rebuild_interval
+                and (self.production_replays + 1)
+                % self.verlet_rebuild_interval
+                == 0
+            )
+        if rebuild:
             self._fixed_builder.initialize_skin(
                 state.positions.to(dtype=self.model_dtype)
             )
         self._graph.replay()
         self.production_replays += 1
+
+    def evaluate_initial(self) -> tuple[Tensor, Tensor, Tensor]:
+        return self(self.state.positions)
+
+    def state_tensors(self) -> dict[str, Tensor]:
+        state = self.state
+        assert state.forces is not None
+        assert state.potential_energy is not None
+        assert state.virial is not None
+        tensors = {
+            "positions": state.positions,
+            "momenta": state.momenta,
+            "forces": state.forces,
+            "energy": state.potential_energy,
+            "virial": state.virial,
+            "step_counter": self.step_counter,
+            "advance": self.advance,
+        }
+        if isinstance(self._integrator, GPUNoseHooverChain):
+            tensors["eta"] = self._integrator.eta
+            tensors["p_eta"] = self._integrator.p_eta
+        return tensors
+
+    def reset_window_stats(self) -> None:
+        self._window_overflow_count.zero_()
+        self._window_dummy_only_replays.zero_()
+        self._window_max_required_neighbors_by_atom.zero_()
+
+    def window_status(self) -> Rob1WindowStatus:
+        return read_rob1_window_status(
+            capacity_misses=self._window_overflow_count,
+            overflow_dummy_only_replays=self._window_dummy_only_replays,
+            maximum_required_by_atom=(
+                self._window_max_required_neighbors_by_atom
+            ),
+            verlet_skin_misses=self._fixed_builder.skin_misses,
+        )
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "cuda_graph_capture_count": self.capture_count,
+            "cuda_graph_capture_wall_time_s": self.capture_wall_time_s,
+            "cuda_graph_production_replays": self.production_replays,
+            "cuda_graph_replay_output_addresses_stable": (
+                self._addresses() == self._state_addresses
+            ),
+            "cuda_graph_edge_capacity": self.capacity_plan.edge_capacity,
+            "neighbor_capacities": list(self.neighbor_capacities),
+            "overflow_dummy_only_replays": int(
+                self._window_dummy_only_replays.detach().cpu()
+            ),
+        }
+
+    def release(self) -> None:
+        self._graph = None  # type: ignore[assignment]
 
     @property
     def last_edge_count(self) -> int:
@@ -1110,6 +1249,79 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
                 f"capacity={self.capacity_plan.neighbors_per_atom}. Increase "
                 "graph_edge_capacity or graph_neighbors_per_atom and restart."
             )
+
+
+def _run_rob1_measured_loop(
+    request: MDRunRequest,
+    controller: Rob1Controller,
+    state: GPUMDState,
+    masses: Tensor,
+    profiler: CudaPhaseProfiler,
+) -> tuple[float, list[Any], list[Any] | None, str | None]:
+    """Run only committed DPA4 transaction boundaries through reporters."""
+
+    config = request.config
+    observations: list[Any] = []
+    memory_frames: list[Any] | None = (
+        [] if config.collect_trajectory and request.output_path is None else None
+    )
+    final_path, partial_path = _prepare_trajectory(request)
+    observation_steps = set(config.observation_steps)
+    boundaries = transaction_boundaries(
+        config.steps,
+        window_steps=int(request.options["rob1_window_steps"]),
+        observation_steps=(
+            config.observation_steps if config.collect_statistics else ()
+        ),
+        record_interval=(config.record_interval if config.collect_trajectory else 0),
+        verlet_rebuild_interval=int(
+            request.options.get("verlet_rebuild_interval", 0)
+        ),
+    )
+
+    torch.cuda.reset_peak_memory_stats(controller.generation.device)
+    torch.cuda.synchronize(controller.generation.device)
+    profiler.start()
+    started = time.perf_counter()
+    with profiler.phase("initial_force"):
+        controller.evaluate_initial()
+    # The zero-step transaction is recoverable too.  If it promoted capacity,
+    # report only the restored/replayed state owned by the replacement graph.
+    state = controller.generation.state  # type: ignore[attr-defined]
+    if config.collect_trajectory:
+        _append_trajectory(
+            _state_to_atoms(request.atoms, state, step=0),
+            memory_frames=memory_frames,
+            partial_path=partial_path,
+        )
+    if config.collect_statistics and 0 in observation_steps:
+        observations.append(_observation(0, state, masses))
+
+    committed = 0
+    for boundary in boundaries:
+        with profiler.phase("md_step"):
+            controller.run_steps(boundary - committed)
+        committed = boundary
+        state = controller.generation.state  # type: ignore[attr-defined]
+        if config.collect_statistics and boundary in observation_steps:
+            observations.append(_observation(boundary, state, masses))
+        if config.collect_trajectory and boundary % config.record_interval == 0:
+            _append_trajectory(
+                _state_to_atoms(request.atoms, state, step=boundary),
+                memory_frames=memory_frames,
+                partial_path=partial_path,
+            )
+    torch.cuda.synchronize(controller.generation.device)
+    profiler.stop()
+    elapsed = time.perf_counter() - started
+    if final_path is not None and partial_path is not None:
+        os.replace(partial_path, final_path)
+    return (
+        elapsed,
+        observations,
+        memory_frames,
+        str(final_path) if final_path is not None else None,
+    )
 
 
 @profile_opt3
@@ -1180,6 +1392,21 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             )
     if configured_search_capacity is None:
         configured_search_capacity = legacy_search_capacity
+    rob1_enabled = bool(request.options.get("_opt4_rob1", False))
+    shared_evaluator: DPA4EnergyForceEvaluator | None = None
+    if rob1_enabled:
+        shared_evaluator = DPA4EnergyForceEvaluator(
+            atoms,
+            request.model_path,
+            device=request.config.device,
+            profiler=profiler,
+        )
+        if request.options.get("_opt4_passes"):
+            from md_benchmark.opt4_registry import prepare_model
+            from .opt4_fusion import install
+
+            prepare_model(shared_evaluator._model, request.options, install)
+
     runner = DPA4WholeStepGraph(
         atoms,
         request.model_path,
@@ -1222,33 +1449,138 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             request.options.get("cuda_graph_thermostat_atol", 1.0e-10)
         ),
         profiler=profiler,
+        shared_evaluator=shared_evaluator,
     )
+    rob1_stats: dict[str, Any] = {}
+    if rob1_enabled:
+        assert shared_evaluator is not None
 
-    for _ in range(request.config.warmup_steps):
-        runner.step(state, runner)
-    torch.cuda.synchronize(device)
-    runner.restore_initial_()
-    runner.production_replays = 0
-    runner._fixed_builder.skin_misses.zero_()
-    runner._fixed_builder.skin_rebuilds = 0
-    runner._fixed_builder.initialize_skin(
-        runner.state.positions.to(dtype=runner.model_dtype)
-    )
+        def generation_factory(
+            capacities: tuple[int, ...], snapshot: Any
+        ) -> DPA4WholeStepGraph:
+            recovery_state = GPUMDState(
+                positions=snapshot["positions"].clone(),
+                momenta=snapshot["momenta"].clone(),
+                forces=snapshot["forces"].clone(),
+                potential_energy=snapshot["energy"].clone(),
+                virial=snapshot["virial"].clone(),
+            )
+            recovery_options = dict(request.options)
+            recovery_options.update(
+                neighbor_capacities=list(capacities),
+                graph_edge_capacity=sum(capacities),
+                graph_neighbors_per_atom=max(capacities),
+                overflow_to_dummy_only=True,
+            )
+            recovery_request = replace(request, options=recovery_options)
+            generation = DPA4WholeStepGraph(
+                atoms,
+                request.model_path,
+                state=recovery_state,
+                masses=masses,
+                request=recovery_request,
+                graph_edge_capacity_factor=float(
+                    request.options.get("graph_edge_capacity_factor", 1.10)
+                ),
+                graph_edge_capacity_headroom=int(
+                    request.options.get("graph_edge_capacity_headroom", 1)
+                ),
+                graph_edge_capacity_alignment=configured_capacity_alignment,
+                graph_edge_capacity=sum(capacities),
+                neighbor_search_capacity=max(capacities),
+                capture_warmup_replays=int(
+                    request.options.get("cuda_graph_capture_warmup_replays", 3)
+                ),
+                validation_state_atol=float(
+                    request.options.get("cuda_graph_state_atol", 1.0e-10)
+                ),
+                validation_force_atol=float(
+                    request.options.get("cuda_graph_force_atol", 1.0e-6)
+                ),
+                validation_energy_atol=float(
+                    request.options.get("cuda_graph_energy_atol", 1.0e-6)
+                ),
+                validation_virial_atol=float(
+                    request.options.get("cuda_graph_virial_atol", 1.0e-5)
+                ),
+                validation_thermostat_atol=float(
+                    request.options.get("cuda_graph_thermostat_atol", 1.0e-10)
+                ),
+                profiler=profiler,
+                shared_evaluator=shared_evaluator,
+            )
+            generation.production_replays = int(
+                snapshot["step_counter"].detach().cpu()
+            )
+            return generation
 
-    elapsed, observations, trajectory, trajectory_path = _run_measured_loop(
-        request,
-        state,
-        runner,
-        runner,
-        masses,
-        profiler,
-    )
-    runner.raise_if_overflow()
-    if runner.production_replays != request.config.steps:
-        raise RuntimeError(
-            "DPA4 Opt3 production replay count mismatch: "
-            f"expected={request.config.steps}, actual={runner.production_replays}"
+        controller = Rob1Controller(
+            runner,
+            generation_factory=generation_factory,
+            atomic_numbers=atoms.get_atomic_numbers(),
+            neighbor_capacities=runner.neighbor_capacities,
         )
+        physical_initial = FixedAddressStateSnapshot(runner.state_tensors())
+        if request.config.warmup_steps:
+            controller.evaluate_initial()
+            warmup_done = 0
+            for boundary in transaction_boundaries(
+                request.config.warmup_steps,
+                window_steps=int(request.options["rob1_window_steps"]),
+                verlet_rebuild_interval=runner.verlet_rebuild_interval,
+            ):
+                controller.run_steps(boundary - warmup_done)
+                warmup_done = boundary
+        physical_initial.restore_into_(controller.generation.state_tensors())
+        runner = controller.generation
+        state = runner.state
+        runner.production_replays = 0
+        runner._fixed_builder.skin_misses.zero_()
+        runner._fixed_builder.skin_rebuilds = 0
+        runner._fixed_builder.initialize_skin(
+            state.positions.to(dtype=runner.model_dtype)
+        )
+        controller.begin_production()
+        elapsed, observations, trajectory, trajectory_path = (
+            _run_rob1_measured_loop(
+                request, controller, state, masses, profiler
+            )
+        )
+        runner = controller.generation
+        state = runner.state
+        rob1_stats = controller.stats()
+        if controller.committed_physical_steps != request.config.steps:
+            raise RuntimeError(
+                "DPA4 Opt4 ROB1 committed-step mismatch: "
+                f"expected={request.config.steps}, "
+                f"actual={controller.committed_physical_steps}"
+            )
+    else:
+        for _ in range(request.config.warmup_steps):
+            runner.step(state, runner)
+        torch.cuda.synchronize(device)
+        runner.restore_initial_()
+        runner.production_replays = 0
+        runner._fixed_builder.skin_misses.zero_()
+        runner._fixed_builder.skin_rebuilds = 0
+        runner._fixed_builder.initialize_skin(
+            runner.state.positions.to(dtype=runner.model_dtype)
+        )
+
+        elapsed, observations, trajectory, trajectory_path = _run_measured_loop(
+            request,
+            state,
+            runner,
+            runner,
+            masses,
+            profiler,
+        )
+        runner.raise_if_overflow()
+        if runner.production_replays != request.config.steps:
+            raise RuntimeError(
+                "DPA4 Opt3 production replay count mismatch: "
+                f"expected={request.config.steps}, actual={runner.production_replays}"
+            )
     final_atoms = _state_to_atoms(atoms, state)
     metadata = {
         "engine": "gpu_resident",
@@ -1287,6 +1619,10 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "graph_initial_edge_count": runner.initial_edge_count,
         "graph_final_edge_count": runner.last_edge_count,
         "graph_max_edge_count": runner.max_edge_count,
+        "graph_padding_fraction_at_max_observed_edges": (
+            runner.capacity_plan.edge_capacity - runner.max_edge_count
+        )
+        / runner.capacity_plan.edge_capacity,
         "graph_capacity_policy": (
             "esen-cap-per-atom-single-graph"
             if len(set(runner.neighbor_capacities)) > 1
@@ -1327,7 +1663,11 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             - int(runner.neighbor_shape_metadata["initial_max_neighbors"]),
         ),
         "graph_padding_policy": "distributed-masked-self-sink-far-vector",
-        "graph_overflow_policy": "explicit-error-no-rollback-no-fallback",
+        "graph_overflow_policy": (
+            "rob1-rollback-promote-recapture-no-eager-fallback"
+            if rob1_enabled
+            else "explicit-error-no-rollback-no-fallback"
+        ),
         "graph_input_addresses_fixed": True,
         "graph_output_addresses_fixed": True,
         "graph_capture_count": runner.capture_count,
@@ -1353,7 +1693,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "cuda_graph": True,
         "cuda_graph_scope": "whole-step",
         "cuda_graph_buckets": False,
-        "transactional_rollback": False,
+        "transactional_rollback": rob1_enabled,
         "kernel_fusion": False,
         "triton": False,
         "cute": False,
@@ -1363,6 +1703,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "trajectory_frame_semantics": "step-0-plus-record-interval",
         "deepmd_inference_env": dict(_DEEPMD_OPT1_ENV),
         "performance_profile": profiler.summary(synchronize=False),
+        **rob1_stats,
     }
     if request.config.integrator == "nose_hoover_chain":
         metadata["nose_hoover_chain"] = {
