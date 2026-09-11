@@ -644,6 +644,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             "virial": float(validation_virial_atol),
             "eta": float(validation_thermostat_atol),
             "p_eta": float(validation_thermostat_atol),
+            "step_counter": 0.0,
         }
         self._integrator = _build_integrator(request, masses)
         n_atoms = int(self.atom_types.shape[1])
