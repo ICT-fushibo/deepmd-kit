@@ -1,74 +1,93 @@
-"""Selective SeZM/SO2 boundaries; never enable the global Triton policy."""
+"""DPA4 Opt4: fixed-slot weighted SO2 destination reduction."""
+from __future__ import annotations
+
 import torch
 from torch import nn
-from md_benchmark.opt4_fx import CheckedRegion, checked_boundary
-from md_benchmark.opt4_ops import focus_pack
-from md_benchmark.opt4_registry import FusionSetupError, record
+
+from md_benchmark.opt4_fx import CheckedRegion
+from md_benchmark.opt4_ops import csr_weighted_segment_sum
+from md_benchmark.opt4_registry import fixed_csr_layout, record
 
 
-class Rotation(nn.Module):
-    def __init__(self, module, back=False, fused=False):
+class _NativeWeightedReduce(nn.Module):
+    def __init__(self, edge_rows: torch.Tensor) -> None:
         super().__init__()
-        self.register_buffer("indices", module.coeff_index_m, persistent=False)
-        self.dim, self.lmax = module.ebed_dim_full, module.lmax
-        # Wigner matrices live in the block-diagonal SO(3) subspace. Off-degree
-        # entries are structural zeros, not independent geometry variables.
-        degree = torch.arange(self.dim, device=module.coeff_index_m.device).sqrt().floor().long()
-        self.register_buffer("degree_mask", degree[:, None] == degree[None, :], persistent=False)
-        self.back, self.fused = back, fused
+        self.register_buffer("edge_rows", edge_rows, persistent=False)
 
-    def forward(self, x, index_or_wigner, wigner=None):
-        if self.fused:
-            from .opt4_rotation import rotation
-            if self.back:
-                return rotation(x, self.indices, index_or_wigner, self.indices, self.degree_mask, self.lmax, True)
-            return rotation(x, index_or_wigner, wigner, self.indices, self.degree_mask, self.lmax, False)
-        if self.back:
-            matrix = (index_or_wigner[:, :self.dim, :self.dim] * self.degree_mask).index_select(2, self.indices)
-            return torch.bmm(matrix, x.transpose(1, 2).reshape(x.shape[0], x.shape[2], -1))
-        matrix = (wigner[:, :self.dim, :self.dim] * self.degree_mask).index_select(1, self.indices)
-        return torch.bmm(matrix, x.index_select(0, index_or_wigner))
+    def forward(self, values, weights, row_scale):
+        out = values.new_zeros((row_scale.shape[0], *values.shape[1:]))
+        out.index_add_(
+            0,
+            self.edge_rows,
+            values * weights.reshape(-1, *((1,) * (values.ndim - 1))),
+        )
+        return out * row_scale.reshape(-1, *((1,) * (values.ndim - 1)))
 
 
-def install(model, passes, report):
-    details = {p: [] for p in passes}
+class _FixedWeightedCSR(nn.Module):
+    def __init__(self, row_ptr, edge_rows, max_row) -> None:
+        super().__init__()
+        self.register_buffer("row_ptr", row_ptr, persistent=False)
+        self.register_buffer("edge_rows", edge_rows, persistent=False)
+        self.max_row = int(max_row)
+
+    def set_layout(self, row_ptr, edge_rows, max_row) -> None:
+        self.row_ptr = row_ptr
+        self.edge_rows = edge_rows
+        self.max_row = int(max_row)
+
+    def forward(self, values, weights, row_scale):
+        return csr_weighted_segment_sum(
+            values.contiguous(),
+            weights.reshape(-1).contiguous(),
+            row_scale.reshape(-1).contiguous(),
+            self.row_ptr,
+            self.edge_rows,
+            self.max_row,
+        )
+
+
+def refresh(model, options) -> None:
+    parameter = next(model.parameters())
+    row_ptr, edge_rows, max_row = fixed_csr_layout(options, parameter)
+    for module in model.modules():
+        region = getattr(module, "_opt4_weighted_csr", None)
+        if isinstance(region, CheckedRegion):
+            region.reference.edge_rows = edge_rows
+            region.compiled.set_layout(row_ptr, edge_rows, max_row)
+            region.signatures.clear()
+
+
+def install(model, passes, report, options):
+    modules = []
+    if "so2_weighted_csr_reduce" not in passes:
+        return
+    parameter = next(model.parameters())
+    row_ptr, edge_rows, max_row = fixed_csr_layout(options, parameter)
     for path, module in list(model.named_modules()):
         if type(module).__name__ != "SO2Convolution":
             continue
-        if module.edge_cartesian or not module.needs_local_frame:
-            continue
-        if module.training or module.use_triton_infer or module.use_cute_infer:
-            raise FusionSetupError("Opt4 requires an eager eval SeZM checkpoint with global acceleration disabled")
-        if "so2_rotation" in passes and module.mmax == 1 and module.compute_dtype == torch.float32:
-            from .opt4_validation import RotationVJPComparison
-            if not hasattr(torch.library, "triton_op"):
-                raise FusionSetupError("this installed PyTorch lacks torch.library.triton_op")
-            detail = {"module": path, "forward": {"benchmark_requested":report.get("benchmark_boundaries",False)}, "back": {"benchmark_requested":report.get("benchmark_boundaries",False)}}
-            detail["back"].update(fused=False, backend="native-bmm",
-                                 reason="block-unrolled rotation_back failed real-checkpoint forward tolerance")
-            detail["forward"]["validation_reduction"] = "shared-native-index-put-accumulate; original float tolerances"
-            module._opt4_rotation_to = CheckedRegion(Rotation(module), detail["forward"], Rotation(module, fused=True),
-                                                    validation_context=RotationVJPComparison)
-            module._opt4_rotation_back = CheckedRegion(Rotation(module, back=True), detail["back"], Rotation(module, back=True, fused=True))
-            details["so2_rotation"].append(detail)
-        if "so2_epilogue" in passes and module.radial_degree_mixer is None and module.node_wise_grid_product is None:
-            module._opt4_epilogue = True
-            pack_detail={"module":path,"benchmark_requested":report.get("benchmark_boundaries",False)}
-            module._opt4_focus_op=checked_boundary(
-                lambda x,r,f:(x*r).reshape(x.shape[0],x.shape[1],f,x.shape[2]//f).permute(2,0,1,3).contiguous(),focus_pack,pack_detail)
-            parameter = next(module.parameters())
-            module.register_buffer("_opt4_minus_one", parameter.new_tensor(-1.), persistent=False)
-            gates = []
-            for i, gate in enumerate(module.non_linearities):
-                if type(gate).__name__ == "GatedActivation":
-                    info = {"module": f"{path}.non_linearities.{i}","benchmark_requested":report.get("benchmark_boundaries",False)}
-                    module.non_linearities[i] = CheckedRegion(gate, info)
-                    gates.append(info)
-            details["so2_epilogue"].append({"module": path, "boundaries": ["radial-focus-pack", "bias-correction", "scaled-residual"], "gates": gates,"pack":pack_detail})
-    for p, modules in details.items():
-        record(report, p, len(modules), "triton-ieee-autograd", modules=modules,
-               precision="checkpoint dtype unchanged; rotation requires FP32 and mmax=1", gemm="SO2Linear unchanged",
-               fusion_scope="forward-only" if p == "so2_rotation" else "forward-and-backward",
-               fused_boundaries=["rotate_to_local"] if p == "so2_rotation" else None,
-               excluded_boundaries=["rotate_back: native-bmm"] if p == "so2_rotation" else [],
-               backward_policy="native-bmm-sorted-index-put-vjp" if p == "so2_rotation" else "compiled")
+        detail = {
+            "module": path,
+            "validated_shapes": 0,
+            "benchmark_requested": report.get("benchmark_boundaries", False),
+        }
+        module._opt4_weighted_csr = CheckedRegion(
+            _NativeWeightedReduce(edge_rows),
+            detail,
+            _FixedWeightedCSR(row_ptr, edge_rows, max_row),
+        )
+        modules.append(detail)
+    record(
+        report,
+        "so2_weighted_csr_reduce",
+        len(modules),
+        "triton-fixed-csr-explicit-vjp",
+        modules=modules,
+        fused_boundaries=["edge-weight", "destination-reduce", "degree-normalize"],
+        gemm="unchanged",
+        rotation="unchanged",
+        radial_mixer="unchanged",
+        reverse_edge=False,
+        fusion_scope="forward-and-backward",
+    )

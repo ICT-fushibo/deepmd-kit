@@ -617,6 +617,10 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             from md_benchmark.opt4_registry import prepare_model
             from .opt4_fusion import install
             prepare_model(self._model, request.options, install)
+        elif shared_evaluator is not None and request.options.get("_opt4_passes"):
+            from .opt4_fusion import refresh
+
+            refresh(self._model, request.options)
         if min(
             validation_state_atol,
             validation_force_atol,
