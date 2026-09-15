@@ -1702,7 +1702,10 @@ class SO2Convolution(nn.Module):
                     edge_weight = edge_weight * edge_src_gate.to(
                         dtype=edge_weight.dtype
                     )
-                if hasattr(self, "_opt4_weighted_csr"):
+                if (
+                    hasattr(self, "_opt4_weighted_csr")
+                    and n_edge == self._opt4_edge_capacity
+                ):
                     out = self._opt4_weighted_csr(
                         x_message.to(dtype=self.compute_dtype),
                         edge_weight,
@@ -1828,19 +1831,45 @@ class SO2Convolution(nn.Module):
                         self.n_atten_head,
                         self.head_dim,
                     )  # (E, D, Fa, H, Ch)
-                    weighted_value = value_heads * attn_alpha.reshape(
-                        n_edge, 1, self.attn_n_focus, self.n_atten_head, 1
-                    )
-                    out_heads = torch.zeros(
-                        n_node,
-                        self.ebed_dim_full,
-                        self.attn_n_focus,
-                        self.n_atten_head,
-                        self.head_dim,
-                        device=x.device,
-                        dtype=compute_dtype,
-                    )  # (N, D, Fa, H, Ch)
-                    out_heads.index_add_(0, dst, weighted_value)
+                    if (
+                        hasattr(self, "_opt4_attention_csr")
+                        and n_edge == self._opt4_edge_capacity
+                    ):
+                        # Fixed-slot Opt4 path.  Focus/head are one group axis so
+                        # the group-specific attention multiply and destination
+                        # reduction execute in one kernel without changing the
+                        # attention normalization or SO2 value computation.
+                        out_heads = self._opt4_attention_csr(
+                            value_heads.reshape(
+                                n_edge,
+                                self.ebed_dim_full,
+                                self.attn_n_focus * self.n_atten_head,
+                                self.head_dim,
+                            ),
+                            attn_alpha.reshape(
+                                n_edge, self.attn_n_focus * self.n_atten_head
+                            ),
+                        ).reshape(
+                            n_node,
+                            self.ebed_dim_full,
+                            self.attn_n_focus,
+                            self.n_atten_head,
+                            self.head_dim,
+                        )
+                    else:
+                        weighted_value = value_heads * attn_alpha.reshape(
+                            n_edge, 1, self.attn_n_focus, self.n_atten_head, 1
+                        )
+                        out_heads = torch.zeros(
+                            n_node,
+                            self.ebed_dim_full,
+                            self.attn_n_focus,
+                            self.n_atten_head,
+                            self.head_dim,
+                            device=x.device,
+                            dtype=compute_dtype,
+                        )  # (N, D, Fa, H, Ch)
+                        out_heads.index_add_(0, dst, weighted_value)
 
                     # === Step 4.4. Output-side head gate ===
                     attn_output_gate = torch.sigmoid(
