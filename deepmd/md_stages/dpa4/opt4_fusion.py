@@ -11,7 +11,10 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from md_benchmark.opt4_fx import CheckedRegion
+from md_benchmark.opt4_fx import (
+    CheckedRegion,
+    assert_float32_vjp_reassociation_close,
+)
 from md_benchmark.opt4_registry import FusionSetupError, record
 
 
@@ -41,8 +44,19 @@ class _FastEqSO2RotateMix(nn.Module):
         object.__setattr__(self, "_convolution", convolution)
         object.__setattr__(self, "_detail", detail)
         self.region = CheckedRegion(
-            _RotateMixReference(), detail, _RotateMixCandidate()
+            _RotateMixReference(),
+            detail,
+            _RotateMixCandidate(),
+            vjp_validator=self.validate_vjp,
         )
+
+    def validate_vjp(self, actual, expected, args, index, output_probes):
+        metrics = assert_float32_vjp_reassociation_close(actual, expected)
+        rows = self._detail.setdefault("vjp_reassociation_validation", [])
+        entry = {"input_index": int(index), **metrics}
+        if entry not in rows:
+            rows.append(entry)
+        return True
 
     def forward(self, x, edge_cache, radial_feat):
         conv = self._convolution
