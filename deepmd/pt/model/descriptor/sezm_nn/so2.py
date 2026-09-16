@@ -2010,7 +2010,14 @@ class SO2Convolution(nn.Module):
         src, dst = edge_cache.src, edge_cache.dst
         n_edge = src.numel()
 
-        if self._triton_value_path is not None and not self.training:
+        if hasattr(self, "_opt4_fasteq_rotate_mix") and not self.training:
+            # Opt4 owns only rotate-to-local plus radial degree mixing.  Its
+            # adapter runs the unchanged native SO2 stack and returns the same
+            # edge-major local layout as the released branch below.
+            x_local, rad_feat = self._opt4_fasteq_rotate_mix(
+                x, edge_cache, radial_feat
+            )
+        elif self._triton_value_path is not None and not self.training:
             # === Steps 1-5 (fused Triton operators). ``so2_rotate_mix`` folds
             # the rotation and the radial degree mixing into one edge-parallel
             # kernel writing the focus-major layout; ``so2_mixing_stack`` runs

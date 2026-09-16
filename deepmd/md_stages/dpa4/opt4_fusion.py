@@ -1,154 +1,168 @@
-"""DPA4 Opt4: fixed-slot weighted SO2 destination reduction."""
+"""DPA4 Opt4 FastEq rotate/radial-mix boundary.
+
+Only the IEEE-fp32 rotate-to-local plus degree mixer is replaced.  The SO2
+linears, gates, attention and destination reduction retain the released path.
+
+Algorithmic adaptation of FastEq commit 40ba40e72bee769d74a869bb4a4ba820ee1c55c0
+(MIT); the integration repository carries the complete third-party notice.
+"""
 from __future__ import annotations
 
 import torch
 from torch import nn
 
 from md_benchmark.opt4_fx import CheckedRegion
-from md_benchmark.opt4_ops import (
-    csr_group_weighted_segment_sum,
-    csr_weighted_segment_sum,
-)
-from md_benchmark.opt4_registry import FusionSetupError, fixed_csr_layout, record
+from md_benchmark.opt4_registry import FusionSetupError, record
 
 
-class _NativeWeightedReduce(nn.Module):
-    def __init__(self, edge_rows: torch.Tensor) -> None:
-        super().__init__()
-        self.register_buffer("edge_rows", edge_rows, persistent=False)
+class _RotateMixReference(nn.Module):
+    def forward(self, x, src, wigner, kc, cb, lmax, n_focus, rank):
+        from deepmd.kernels.triton.sezm.so2_value_path import _rotate_mix_reference
 
-    def forward(self, values, weights, row_scale):
-        out = values.new_zeros((row_scale.shape[0], *values.shape[1:]))
-        out.index_add_(
-            0,
-            self.edge_rows,
-            values * weights.reshape(-1, *((1,) * (values.ndim - 1))),
-        )
-        return out * row_scale.reshape(-1, *((1,) * (values.ndim - 1)))
-
-
-class _FixedWeightedCSR(nn.Module):
-    def __init__(self, row_ptr, edge_rows, max_row) -> None:
-        super().__init__()
-        self.register_buffer("row_ptr", row_ptr, persistent=False)
-        self.register_buffer("edge_rows", edge_rows, persistent=False)
-        self.max_row = int(max_row)
-
-    def set_layout(self, row_ptr, edge_rows, max_row) -> None:
-        self.row_ptr = row_ptr
-        self.edge_rows = edge_rows
-        self.max_row = int(max_row)
-
-    def forward(self, values, weights, row_scale):
-        return csr_weighted_segment_sum(
-            values.contiguous(),
-            weights.reshape(-1).contiguous(),
-            row_scale.reshape(-1).contiguous(),
-            self.row_ptr,
-            self.edge_rows,
-            self.max_row,
+        return _rotate_mix_reference(
+            x, src, wigner, kc, cb.detach(), lmax, n_focus, rank
         )
 
 
-class _NativeAttentionReduce(nn.Module):
-    def __init__(self, edge_rows: torch.Tensor, rows: int) -> None:
-        super().__init__()
-        self.register_buffer("edge_rows", edge_rows, persistent=False)
-        self.rows = int(rows)
+class _RotateMixCandidate(nn.Module):
+    def forward(self, x, src, wigner, kc, cb, lmax, n_focus, rank):
+        from deepmd.kernels.triton.sezm.so2_value_path import _rotate_mix_op
 
-    def forward(self, values, weights):
-        out = values.new_zeros((self.rows, *values.shape[1:]))
-        out.index_add_(0, self.edge_rows, values * weights[:, None, :, None])
-        return out
-
-
-class _FixedAttentionCSR(nn.Module):
-    def __init__(self, row_ptr, edge_rows, max_row) -> None:
-        super().__init__()
-        self.register_buffer("row_ptr", row_ptr, persistent=False)
-        self.register_buffer("edge_rows", edge_rows, persistent=False)
-        self.max_row = int(max_row)
-
-    def set_layout(self, row_ptr, edge_rows, max_row) -> None:
-        self.row_ptr = row_ptr
-        self.edge_rows = edge_rows
-        self.max_row = int(max_row)
-
-    def forward(self, values, weights):
-        return csr_group_weighted_segment_sum(
-            values.contiguous(),
-            weights.contiguous(),
-            self.row_ptr,
-            self.edge_rows,
-            self.max_row,
+        return _rotate_mix_op(
+            x, src, wigner, kc, cb.detach(), lmax, n_focus, rank
         )
+
+
+class _FastEqSO2RotateMix(nn.Module):
+    """Use DeepMD's explicit-VJP Triton primitive, then the native SO2 stack."""
+
+    def __init__(self, convolution, detail: dict) -> None:
+        super().__init__()
+        object.__setattr__(self, "_convolution", convolution)
+        object.__setattr__(self, "_detail", detail)
+        self.region = CheckedRegion(
+            _RotateMixReference(), detail, _RotateMixCandidate()
+        )
+
+    def forward(self, x, edge_cache, radial_feat):
+        conv = self._convolution
+        if conv.radial_hidden_proj is not None:
+            rad_feat = conv.radial_hidden_proj(radial_feat)
+        else:
+            rad_feat = radial_feat
+        mixer = conv.radial_degree_mixer
+        if mixer is None:
+            kc = rad_feat
+            cb = rad_feat.new_zeros(1)
+            rank = 0
+        else:
+            kc = torch.matmul(rad_feat.reshape(rad_feat.shape[0], -1), mixer.weight)
+            cb = mixer.channel_basis.reshape(-1).detach()
+            rank = mixer.rank
+
+        x_local = self.region(
+            x.contiguous(),
+            edge_cache.src,
+            edge_cache.D_full,
+            kc.contiguous(),
+            cb.contiguous(),
+            conv.lmax,
+            conv.n_focus,
+            rank,
+        ).view(
+            conv.n_focus,
+            edge_cache.src.shape[0],
+            3 * conv.lmax + 1,
+            conv.so2_focus_dim,
+        )
+        focus_gate_src = x_local[:, :, 0, :]
+        for so2_linear, inter_norm, non_linear in zip(
+            conv.so2_linears,
+            conv.so2_inter_norms,
+            conv.non_linearities,
+            strict=True,
+        ):
+            residual = x_local
+            x_local = non_linear(so2_linear(inter_norm(x_local)))
+            x_local = residual + x_local
+        if conv.focus_compete and conv.n_focus > 1:
+            alpha = conv._focus_alpha(focus_gate_src.transpose(0, 1))
+            x_local = x_local * alpha.transpose(0, 1).to(
+                dtype=x_local.dtype
+            ).unsqueeze(-1).unsqueeze(-1)
+        x_local = x_local.permute(1, 0, 2, 3)
+        self._detail["captured_output_bytes"] = (
+            x_local.numel() * x_local.element_size()
+            + rad_feat.numel() * rad_feat.element_size()
+        )
+        return x_local, rad_feat
 
 
 def refresh(model, options) -> None:
-    parameter = next(model.parameters())
-    row_ptr, edge_rows, max_row = fixed_csr_layout(options, parameter)
+    # This boundary has no CAP-dependent buffers.  A ROB1 recapture reuses the
+    # installed operator and live edge_cache tensors.
     for module in model.modules():
-        if hasattr(module, "_opt4_weighted_csr") or hasattr(
-            module, "_opt4_attention_csr"
-        ):
-            module._opt4_edge_capacity = int(edge_rows.numel())
-        region = getattr(module, "_opt4_weighted_csr", None)
-        if isinstance(region, CheckedRegion):
-            region.reference.edge_rows = edge_rows
-            region.compiled.set_layout(row_ptr, edge_rows, max_row)
-            region.signatures.clear()
-        attention = getattr(module, "_opt4_attention_csr", None)
-        if isinstance(attention, CheckedRegion):
-            attention.reference.edge_rows = edge_rows
-            attention.reference.rows = row_ptr.shape[0] - 1
-            attention.compiled.set_layout(row_ptr, edge_rows, max_row)
-            attention.signatures.clear()
+        adapter = getattr(module, "_opt4_fasteq_rotate_mix", None)
+        if isinstance(adapter, _FastEqSO2RotateMix):
+            adapter.region.signatures.clear()
 
 
 def install(model, passes, report, options):
-    modules = []
-    if "so2_weighted_csr_reduce" not in passes:
+    if "fasteq_so2_rotate_mix" not in passes:
         return
-    parameter = next(model.parameters())
-    row_ptr, edge_rows, max_row = fixed_csr_layout(options, parameter)
+    try:
+        from deepmd.kernels.triton.sezm.so2_value_path import (
+            SO2_VALUE_PATH_TRITON_AVAILABLE,
+            _is_supported,
+        )
+    except Exception as exc:
+        raise FusionSetupError("DeepMD SO2 Triton primitive is unavailable") from exc
+    if not SO2_VALUE_PATH_TRITON_AVAILABLE:
+        raise FusionSetupError("DeepMD SO2 Triton primitive is unavailable")
+
+    modules = []
     for path, module in list(model.named_modules()):
         if type(module).__name__ != "SO2Convolution":
             continue
+        if not _is_supported(module):
+            raise FusionSetupError(
+                f"DPA4 SO2 module {path!r} is outside the validated FastEq layout"
+            )
+        if module._triton_value_path is not None or module._cute_value_path is not None:
+            raise FusionSetupError(
+                "fasteq_so2_rotate_mix requires the released value path; do not set "
+                "DP_TRITON_INFER or DP_CUTE_INFER"
+            )
         detail = {
             "module": path,
+            "lmax": int(module.lmax),
+            "mmax": int(module.mmax),
+            "focus_dim": int(module.so2_focus_dim),
+            "n_focus": int(module.n_focus),
+            "radial_mixer_rank": int(
+                getattr(module.radial_degree_mixer, "rank", 0)
+            ),
             "validated_shapes": 0,
             "benchmark_requested": report.get("benchmark_boundaries", False),
         }
-        module._opt4_edge_capacity = int(edge_rows.numel())
-        if int(getattr(module, "n_atten_head", 0)) > 0:
-            if bool(getattr(module, "use_flash_atten", False)):
-                raise FusionSetupError(
-                    "so2_weighted_csr_reduce cannot replace an active DPA4 flash-attention path"
-                )
-            module._opt4_attention_csr = CheckedRegion(
-                _NativeAttentionReduce(edge_rows, row_ptr.shape[0] - 1),
-                detail,
-                _FixedAttentionCSR(row_ptr, edge_rows, max_row),
-            )
-            detail["aggregation_mode"] = "attention-focus-head"
-        else:
-            module._opt4_weighted_csr = CheckedRegion(
-                _NativeWeightedReduce(edge_rows),
-                detail,
-                _FixedWeightedCSR(row_ptr, edge_rows, max_row),
-            )
-            detail["aggregation_mode"] = "envelope-degree"
+        module._opt4_fasteq_rotate_mix = _FastEqSO2RotateMix(module, detail)
         modules.append(detail)
     record(
         report,
-        "so2_weighted_csr_reduce",
+        "fasteq_so2_rotate_mix",
         len(modules),
-        "triton-fixed-csr-forward-value-vjp-aten-weight-vjp",
+        "deepmd-triton-so2-rotate-mix-explicit-vjp",
         modules=modules,
-        fused_boundaries=["attention-or-edge-weight", "destination-reduce"],
-        gemm="unchanged",
-        rotation="unchanged",
-        radial_mixer="unchanged",
-        reverse_edge=False,
-        fusion_scope="forward-and-value-vjp; native-order explicit weight-vjp",
+        fused_boundaries=[
+            "dynamic-source-gather",
+            "wigner-rotate-to-local",
+            "degree-radial-broadcast-multiply",
+            "focus-major-store",
+        ],
+        so2_gemm="released-path",
+        attention="released-path",
+        destination_reduce="released-path",
+        global_triton_infer=False,
+        backward="explicit-node-wigner-radial-vjp",
+        replay_runtime_compile=False,
     )
