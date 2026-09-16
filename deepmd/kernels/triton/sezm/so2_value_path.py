@@ -152,6 +152,18 @@ _ROTATE_MIX_BWD_CONFIG = (1, 2)  # per-edge backward (warps, stages)
 # ======================================================================
 # Eager reference / fallback implementations
 # ======================================================================
+def _wigner_block_mask(lmax: int, device: torch.device) -> Tensor:
+    """Return the structural block support of a real Wigner-D matrix."""
+
+    dim = (lmax + 1) ** 2
+    mask = torch.zeros((dim, dim), dtype=torch.bool, device=device)
+    for degree in range(lmax + 1):
+        begin = degree * degree
+        end = (degree + 1) * (degree + 1)
+        mask[begin:end, begin:end] = True
+    return mask
+
+
 def _rotate_mix_reference(
     x: Tensor,
     src: Tensor,
@@ -176,7 +188,8 @@ def _rotate_mix_reference(
     n_deg = lmax + 1
     reduced = 3 * lmax + 1
     coeff = build_m_major_index(lmax, 1, device=x.device)
-    d_to_m = wigner[:, :dim, :dim].index_select(1, coeff)
+    block_mask = _wigner_block_mask(lmax, wigner.device)
+    d_to_m = (wigner[:, :dim, :dim] * block_mask).index_select(1, coeff)
     x_local = torch.bmm(d_to_m, x.index_select(0, src))  # (E, reduced, C_wide)
     if rank == 0:
         # kc holds per-degree radial features (E, lmax+1, C_wide); each reduced
@@ -235,7 +248,8 @@ def _rotate_mix_backward_reference(
     n_deg = lmax + 1
     reduced = 3 * lmax + 1
     coeff = build_m_major_index(lmax, 1, device=x.device)
-    d_to_m = wigner[:, :dim, :dim].index_select(1, coeff)
+    block_mask = _wigner_block_mask(lmax, wigner.device)
+    d_to_m = (wigner[:, :dim, :dim] * block_mask).index_select(1, coeff)
     x_src = x.index_select(0, src)
     x_local = torch.bmm(d_to_m, x_src)  # (E, reduced, C_wide)
 
@@ -290,6 +304,7 @@ def _rotate_mix_backward_reference(
     grad_rows = torch.bmm(g_local, x_src.transpose(1, 2))  # (E, reduced, D)
     grad_block = wigner.new_zeros(n_edge, dim, dim)
     grad_block.index_copy_(1, coeff, grad_rows)
+    grad_block.mul_(block_mask)
     grad_wigner = torch.zeros_like(wigner)
     grad_wigner[:, :dim, :dim] = grad_block
     return grad_x_edge, grad_wigner, grad_kc

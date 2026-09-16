@@ -747,6 +747,54 @@ class TestSeZMTritonValuePath(unittest.TestCase):
                         rtol=1e-4,
                     )
 
+    def test_rotate_mix_reference_masks_structurally_invalid_wigner_vjp(self):
+        """The setup oracle must share the block-sparse Wigner contract."""
+
+        from deepmd.kernels.triton.sezm.so2_value_path import (
+            _rotate_mix_reference,
+        )
+
+        generator = torch.Generator(device="cuda").manual_seed(19)
+        lmax = 3
+        dim = (lmax + 1) ** 2
+        n_edge = 17
+        channels = 8
+        x = torch.randn(
+            5, dim, channels, device="cuda", generator=generator
+        ).requires_grad_(True)
+        src = torch.randint(
+            0, x.shape[0], (n_edge,), device="cuda", generator=generator
+        )
+        wigner = torch.randn(
+            n_edge, dim, dim, device="cuda", generator=generator
+        ).requires_grad_(True)
+        radial = torch.randn(
+            n_edge,
+            lmax + 1,
+            channels,
+            device="cuda",
+            generator=generator,
+        ).requires_grad_(True)
+        mask = _block_mask(lmax, "cuda")
+
+        got = _rotate_mix_reference(
+            x, src, wigner, radial, radial.new_zeros(1), lmax, 1, 0
+        )
+        want = _rotate_mix_reference(
+            x,
+            src,
+            wigner * mask,
+            radial,
+            radial.new_zeros(1),
+            lmax,
+            1,
+            0,
+        )
+        torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
+
+        (grad_wigner,) = torch.autograd.grad(got.square().sum(), wigner)
+        self.assertEqual(float(grad_wigner[:, ~mask].abs().max()), 0.0)
+
     def test_factory_rejects_unsupported_layouts(self):
         from deepmd.kernels.triton.sezm.so2_value_path import (
             make_triton_value_path,
