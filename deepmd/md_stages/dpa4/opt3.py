@@ -1692,6 +1692,24 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "md_state_precision": "float64",
         **_evaluator_metadata(runner),
         "stress_convention": "ase-tensile=-sym(deepmd-virial)/volume",
+        "compute_stress": request.config.collect_trajectory,
+        "trajectory_stress_backend": (
+            "whole-step-cuda-graph-virial"
+            if request.config.collect_trajectory
+            else None
+        ),
+        "trajectory_stress_recompute_count": 0,
+        "trajectory_record_interval": (
+            request.config.record_interval
+            if request.config.collect_trajectory
+            else 0
+        ),
+        "trajectory_frame_count": (
+            request.config.steps // request.config.record_interval + 1
+            if request.config.collect_trajectory
+            else 0
+        ),
+        "trajectory_stress_cost_in_elapsed": request.config.collect_trajectory,
         "checkpoint_modified": False,
         "warmup_steps": request.config.warmup_steps,
         "torch_compile": False,
