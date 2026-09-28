@@ -66,7 +66,7 @@ from deepmd.md_stages.dpa3.opt1 import (
     _observation,
     _prepare_trajectory,
     _run_measured_loop,
-    _state_to_atoms,
+    _state_to_atoms as _virial_state_to_atoms,
 )
 from deepmd.md_stages.dpa4.opt1 import (
     _DEEPMD_OPT1_ENV,
@@ -173,9 +173,7 @@ class _FixedShapeDPA4NeighborBuilder:
         self.device = cell.device
         self.cell = cell.detach().reshape(3, 3).contiguous()
         self.inverse_cell = torch.linalg.inv(self.cell).contiguous()
-        self.repetitions = _pbc_repetitions(
-            self.cell, self.cutoff + self.verlet_skin
-        )
+        self.repetitions = _pbc_repetitions(self.cell, self.cutoff + self.verlet_skin)
         axes = [
             torch.arange(
                 -repeat,
@@ -209,12 +207,12 @@ class _FixedShapeDPA4NeighborBuilder:
             return
         fractional = torch.mm(positions, self.inverse_cell)
         reference_images = torch.floor(fractional)
-        candidate_positions = torch.mm(
-            torch.remainder(fractional, 1.0), self.cell
-        )
+        candidate_positions = torch.mm(torch.remainder(fractional, 1.0), self.cell)
         requested = self.verlet_candidate_capacity
-        slots = max(self.neighbors_per_atom, int(requested)) if requested is not None else max(
-            self.neighbors_per_atom * 2, self.neighbors_per_atom + 32
+        slots = (
+            max(self.neighbors_per_atom, int(requested))
+            if requested is not None
+            else max(self.neighbors_per_atom * 2, self.neighbors_per_atom + 32)
         )
         slots = min(slots, self.candidates_per_atom)
         selected, counts, selected_valid = select_skin_candidates(
@@ -249,9 +247,7 @@ class _FixedShapeDPA4NeighborBuilder:
         self.verlet_candidate_capacity = slots
         self.skin_rebuilds += 1
 
-    def build(
-        self, positions: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def build(self, positions: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         """Return wrapped positions and one fixed row of slots per centre."""
         if positions.shape != (self.num_atoms, 3):
             raise ValueError("DPA4 fixed builder received the wrong atom shape")
@@ -285,15 +281,17 @@ class _FixedShapeDPA4NeighborBuilder:
             image_delta = torch.floor(fractional) - self.skin_reference_images
             candidate_shifts = (
                 candidate_shifts
-                + image_delta.index_select(
-                    0, candidate_sources.reshape(-1)
-                ).reshape(self.num_atoms, -1, 3)
+                + image_delta.index_select(0, candidate_sources.reshape(-1)).reshape(
+                    self.num_atoms, -1, 3
+                )
                 - image_delta.unsqueeze(1)
             )
             candidate_width = int(candidate_sources.shape[1])
-            candidates = torch.arange(
-                candidate_width, dtype=torch.long, device=self.device
-            ).reshape(1, -1).expand(self.num_atoms, -1)
+            candidates = (
+                torch.arange(candidate_width, dtype=torch.long, device=self.device)
+                .reshape(1, -1)
+                .expand(self.num_atoms, -1)
+            )
             shifted_sources = wrapped.index_select(
                 0, candidate_sources.reshape(-1)
             ).reshape(self.num_atoms, candidate_width, 3) + torch.mm(
@@ -302,9 +300,9 @@ class _FixedShapeDPA4NeighborBuilder:
             vectors = shifted_sources - wrapped.unsqueeze(1)
             valid_candidates = self.skin_candidate_mask
         else:
-            shifted_sources = wrapped.index_select(0, self.candidate_sources) + torch.mm(
-                self.candidate_shifts.to(dtype=positions.dtype), self.cell
-            )
+            shifted_sources = wrapped.index_select(
+                0, self.candidate_sources
+            ) + torch.mm(self.candidate_shifts.to(dtype=positions.dtype), self.cell)
             candidates = self.candidate_ids.expand(self.num_atoms, -1)
             candidate_sources = self.candidate_sources.reshape(1, -1).expand(
                 self.num_atoms, -1
@@ -316,8 +314,10 @@ class _FixedShapeDPA4NeighborBuilder:
             valid_candidates = torch.ones_like(candidates, dtype=torch.bool)
         candidate_sentinel = int(candidates.shape[1])
         distance_sqr = vectors.square().sum(dim=-1)
-        valid = valid_candidates & (distance_sqr <= self.cutoff * self.cutoff) & (
-            distance_sqr > 1.0e-10
+        valid = (
+            valid_candidates
+            & (distance_sqr <= self.cutoff * self.cutoff)
+            & (distance_sqr > 1.0e-10)
         )
         counts = valid.sum(dim=1)
         ordered = torch.where(
@@ -335,9 +335,7 @@ class _FixedShapeDPA4NeighborBuilder:
         selected_valid = selected < candidate_sentinel
         safe = selected.clamp_max(candidate_sentinel - 1)
         sources = torch.gather(candidate_sources, 1, safe)
-        shifts = torch.gather(
-            candidate_shifts, 1, safe.unsqueeze(-1).expand(-1, -1, 3)
-        )
+        shifts = torch.gather(candidate_shifts, 1, safe.unsqueeze(-1).expand(-1, -1, 3))
         sources = torch.where(selected_valid, sources, self.centres)
         shifts = torch.where(
             selected_valid.unsqueeze(-1), shifts, torch.zeros_like(shifts)
@@ -372,9 +370,7 @@ def _resolve_capacity_plan(
         math.ceil(initial_max_neighbors * float(capacity_factor)),
         1,
     )
-    aligned_guarded_initial = _round_up(
-        guarded_initial, int(capacity_alignment)
-    )
+    aligned_guarded_initial = _round_up(guarded_initial, int(capacity_alignment))
     total_edge_derived: int | None = None
 
     if explicit_edge_capacity is not None:
@@ -518,12 +514,14 @@ def _fixed_edge_schema_from_neighbor_matrix(
         < capacities_tensor.reshape(-1, 1)
     )
     valid_search = valid_search_matrix.reshape(-1).index_select(0, selection_indices)
-    src_raw = neighbor_matrix.reshape(-1).to(dtype=torch.long).index_select(
-        0, selection_indices
+    src_raw = (
+        neighbor_matrix.reshape(-1)
+        .to(dtype=torch.long)
+        .index_select(0, selection_indices)
     )
     src = torch.where(valid_search, src_raw, dst)
-    shift = shifts.reshape(-1, 3).to(dtype=coord.dtype).index_select(
-        0, selection_indices
+    shift = (
+        shifts.reshape(-1, 3).to(dtype=coord.dtype).index_select(0, selection_indices)
     )
     shift = torch.where(valid_search.unsqueeze(1), shift, torch.zeros_like(shift))
 
@@ -533,9 +531,7 @@ def _fixed_edge_schema_from_neighbor_matrix(
         edge_vec = edge_vec + (shift[:, :, None] * cell[0]).sum(dim=1)
     edge_len2 = torch.sum(edge_vec.square(), dim=-1)
     edge_mask = (
-        valid_search
-        & (edge_len2 > 1.0e-10)
-        & (edge_len2 <= float(rcut) * float(rcut))
+        valid_search & (edge_len2 > 1.0e-10) & (edge_len2 <= float(rcut) * float(rcut))
     )
     if force_dummy_only is not None:
         edge_mask = edge_mask & ~force_dummy_only
@@ -572,6 +568,16 @@ def _fixed_edge_schema_from_neighbor_matrix(
         edge_scatter_index=edge_index,
         edge_mask=edge_mask,
     )
+
+
+def _state_to_atoms(
+    template: Any, state: GPUMDState, *, step: int | None = None
+) -> Any:
+    if getattr(state, "stress", None) is not None:
+        from md_benchmark.stress_capture import captured_frame
+
+        return captured_frame(template, state, step)
+    return _virial_state_to_atoms(template, state, step=step)
 
 
 class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
@@ -616,18 +622,22 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         if shared_evaluator is None and request.options.get("_opt4_passes"):
             from md_benchmark.opt4_registry import prepare_model
             from .opt4_fusion import install
+
             prepare_model(self._model, request.options, install)
         elif shared_evaluator is not None and request.options.get("_opt4_passes"):
             from .opt4_fusion import refresh
 
             refresh(self._model, request.options)
-        if min(
-            validation_state_atol,
-            validation_force_atol,
-            validation_energy_atol,
-            validation_virial_atol,
-            validation_thermostat_atol,
-        ) < 0:
+        if (
+            min(
+                validation_state_atol,
+                validation_force_atol,
+                validation_energy_atol,
+                validation_virial_atol,
+                validation_thermostat_atol,
+            )
+            < 0
+        ):
             raise ValueError("CUDA Graph validation tolerances must be non-negative")
         if not hasattr(torch.cuda, "CUDAGraph"):
             raise RuntimeError("This PyTorch build does not provide CUDA Graph")
@@ -637,6 +647,8 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         self.state = state
         self.masses = masses.reshape(-1, 1)
         self.request = request
+        self.capture_stress = bool(request.options.get("_opt4_capture_stress", False))
+        self.stress_volume = float(atoms.get_volume())
         self.overflow_to_dummy_only = bool(
             request.options.get("overflow_to_dummy_only", False)
         )
@@ -649,6 +661,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             "eta": float(validation_thermostat_atol),
             "p_eta": float(validation_thermostat_atol),
             "step_counter": 0.0,
+            "stress": 1.0e-8,
         }
         self._integrator = _build_integrator(request, masses)
         n_atoms = int(self.atom_types.shape[1])
@@ -701,7 +714,8 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
                 if len(set(self.neighbor_capacities)) > 1
                 else (
                     "initial-per-atom-cap-vector"
-                    if explicit_caps is None and request.options.get("per_atom_cap", False)
+                    if explicit_caps is None
+                    and request.options.get("per_atom_cap", False)
                     else self.capacity_plan.source
                 )
             ),
@@ -747,8 +761,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         )
         if bool(fixed_initial_excess.max().item() > 0):
             raise RuntimeError(
-                "DPA4 Opt3 per-atom capacity vector is smaller than the "
-                "initial graph"
+                "DPA4 Opt3 per-atom capacity vector is smaller than the initial graph"
             )
         self.neighbor_shape_metadata = {
             "initial_max_neighbors": initial_max_neighbors,
@@ -773,12 +786,8 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         )
         self._max_required_neighbors_by_atom.copy_(fixed_initial_counts.to(torch.int64))
         self._initial_neighbors_by_atom = fixed_initial_counts.to(torch.int64).clone()
-        self._overflow_flag = torch.zeros(
-            (), dtype=torch.bool, device=self.device
-        )
-        self._overflow_count = torch.zeros(
-            (), dtype=torch.int64, device=self.device
-        )
+        self._overflow_flag = torch.zeros((), dtype=torch.bool, device=self.device)
+        self._overflow_count = torch.zeros((), dtype=torch.int64, device=self.device)
         self._window_overflow_count = torch.zeros(
             (), dtype=torch.int64, device=self.device
         )
@@ -795,6 +804,11 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         state.forces = initial_force.to(dtype=torch.float64).clone()
         state.potential_energy = initial_energy.clone()
         state.virial = initial_virial.clone()
+        if self.capture_stress:
+            from md_benchmark.stress_capture import deepmd_stress
+
+            state.stress = deepmd_stress(state.virial, self.stress_volume).clone()
+            self._initial_stress = state.stress.clone()
         self.initial_edge_count = int(initial_edge_count.detach().cpu())
         self._last_edge_count = initial_edge_count.to(dtype=torch.int64).clone()
         self._max_edge_count = self._last_edge_count.clone()
@@ -854,6 +868,8 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             self.step_counter,
             self.advance,
         ]
+        if self.capture_stress:
+            tensors.append(state.stress)
         if isinstance(self._integrator, GPUNoseHooverChain):
             tensors.extend((self._integrator.eta, self._integrator.p_eta))
         return tuple(tensor.data_ptr() for tensor in tensors)
@@ -865,8 +881,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         )
         required = num_neighbors.max().to(dtype=torch.int64)
         overflow_by_atom = torch.clamp_min(
-            num_neighbors
-            - self._neighbor_capacities_tensor,
+            num_neighbors - self._neighbor_capacities_tensor,
             0,
         )
         overflow = overflow_by_atom.max() > 0
@@ -912,9 +927,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             neighbor_capacities=self.neighbor_capacities,
             _slot_centres=self._fixed_builder.slot_centres,
             _selection_indices=self._fixed_builder.selection_indices,
-            _neighbor_capacities_tensor=(
-                self._fixed_builder.neighbor_capacities
-            ),
+            _neighbor_capacities_tensor=(self._fixed_builder.neighbor_capacities),
             force_dummy_only=(overflow if self.overflow_to_dummy_only else None),
         )
 
@@ -956,6 +969,9 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         assert state.forces is not None
         assert state.potential_energy is not None
         assert state.virial is not None
+        if self.capture_stress and isinstance(self._integrator, GPUNoseHooverChain):
+            old_eta = self._integrator.eta.clone()
+            old_p_eta = self._integrator.p_eta.clone()
 
         if isinstance(self._integrator, GPUVelocityVerletBerendsen):
             momenta = self._integrator._scale_momenta(state.momenta)
@@ -965,19 +981,25 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
                 state.positions
                 + self._integrator.dt * momenta / self._integrator.masses
             )
+            if self.capture_stress:
+                positions = state.positions + self.advance * (
+                    positions - state.positions
+                )
             force, energy, virial, edge_count = self._evaluate_positions(positions)
             force64 = force.to(dtype=torch.float64)
             momenta = momenta + 0.5 * self._integrator.dt * force64
         elif isinstance(self._integrator, GPUNoseHooverChain):
             half_dt = self._integrator.dt / 2.0
-            momenta = self._integrator._integrate_thermostat(
-                state.momenta, half_dt
-            )
+            momenta = self._integrator._integrate_thermostat(state.momenta, half_dt)
             momenta = momenta + half_dt * state.forces
             positions = (
                 state.positions
                 + self._integrator.dt * momenta / self._integrator.masses
             )
+            if self.capture_stress:
+                positions = state.positions + self.advance * (
+                    positions - state.positions
+                )
             force, energy, virial, edge_count = self._evaluate_positions(positions)
             force64 = force.to(dtype=torch.float64)
             momenta = momenta + half_dt * force64
@@ -987,6 +1009,18 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
 
         # These in-place writes are the loop-carried dependencies.  Replays
         # read exactly the storage written by the preceding replay.
+        if self.capture_stress:
+            from md_benchmark.stress_capture import deepmd_stress
+
+            momenta = state.momenta + self.advance * (momenta - state.momenta)
+            state.stress.copy_(deepmd_stress(virial, self.stress_volume))
+            if isinstance(self._integrator, GPUNoseHooverChain):
+                self._integrator.eta.copy_(
+                    old_eta + self.advance * (self._integrator.eta - old_eta)
+                )
+                self._integrator.p_eta.copy_(
+                    old_p_eta + self.advance * (self._integrator.p_eta - old_p_eta)
+                )
         state.positions.copy_(positions)
         state.momenta.copy_(momenta)
         state.forces.copy_(force64)
@@ -994,7 +1028,9 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         state.virial.copy_(virial)
         self._last_edge_count.copy_(edge_count)
         self._max_edge_count.copy_(torch.maximum(self._max_edge_count, edge_count))
-        self.step_counter.add_(1)
+        self.step_counter.add_(
+            self.advance.to(torch.long) if self.capture_stress else 1
+        )
 
     def restore_initial_(self) -> None:
         state = self.state
@@ -1006,6 +1042,8 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         state.forces.copy_(self._initial_forces)
         state.potential_energy.copy_(self._initial_energy)
         state.virial.copy_(self._initial_virial)
+        if self.capture_stress:
+            state.stress.copy_(self._initial_stress)
         self._last_edge_count.fill_(self.initial_edge_count)
         self._max_edge_count.fill_(self.initial_edge_count)
         self._last_required_neighbors.fill_(
@@ -1037,6 +1075,8 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             "virial": state.virial.clone(),
             "step_counter": self.step_counter.clone(),
         }
+        if self.capture_stress:
+            snapshot["stress"] = state.stress.clone()
         if isinstance(self._integrator, GPUNoseHooverChain):
             snapshot["eta"] = self._integrator.eta.clone()
             snapshot["p_eta"] = self._integrator.p_eta.clone()
@@ -1067,6 +1107,15 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             self._step_body()
             torch.cuda.synchronize(self.device)
             eager_state = self._state_snapshot()
+            if self.capture_stress:
+                from md_benchmark.stress_capture import validate_stress
+
+                validate_stress(
+                    graph_state["stress"],
+                    eager_state["stress"],
+                    dtype=self.model_dtype,
+                    context="DPA4 captured stress",
+                )
             if graph_state.keys() != eager_state.keys():
                 raise RuntimeError(
                     "DPA4 Opt3 graph/eager validation state fields differ"
@@ -1090,8 +1139,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
                 for name, eager in eager_state.items()
             }
             if not all(
-                math.isfinite(error)
-                for error in self.validation_errors.values()
+                math.isfinite(error) for error in self.validation_errors.values()
             ):
                 raise FloatingPointError(
                     "DPA4 Opt3 capture validation produced non-finite errors"
@@ -1101,9 +1149,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
                 name: {
                     "max_abs_error": error,
                     "absolute_tolerance": self.validation_tolerances[name],
-                    "within_tolerance": (
-                        error <= self.validation_tolerances[name]
-                    ),
+                    "within_tolerance": (error <= self.validation_tolerances[name]),
                 }
                 for name, error in self.validation_errors.items()
             }
@@ -1132,6 +1178,11 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         """Eager fixed-capacity initial force used by the shared timer."""
         if positions.data_ptr() != self.state.positions.data_ptr():
             raise RuntimeError("DPA4 Opt3 initial evaluator requires static positions")
+        if self.capture_stress:
+            self.advance.zero_()
+            self._graph.replay()
+            self.advance.fill_(1.0)
+            return self.state.forces, self.state.potential_energy, self.state.virial
         force, energy, virial, edge_count = self._evaluate_positions(positions)
         state = self.state
         assert state.forces is not None
@@ -1163,9 +1214,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         else:
             rebuild = bool(
                 self.verlet_rebuild_interval
-                and (self.production_replays + 1)
-                % self.verlet_rebuild_interval
-                == 0
+                and (self.production_replays + 1) % self.verlet_rebuild_interval == 0
             )
         if rebuild:
             self._fixed_builder.initialize_skin(
@@ -1191,6 +1240,8 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
             "step_counter": self.step_counter,
             "advance": self.advance,
         }
+        if self.capture_stress:
+            tensors["stress"] = state.stress
         if isinstance(self._integrator, GPUNoseHooverChain):
             tensors["eta"] = self._integrator.eta
             tensors["p_eta"] = self._integrator.p_eta
@@ -1205,9 +1256,7 @@ class DPA4WholeStepGraph(DPA4EnergyForceEvaluator):
         return read_rob1_window_status(
             capacity_misses=self._window_overflow_count,
             overflow_dummy_only_replays=self._window_dummy_only_replays,
-            maximum_required_by_atom=(
-                self._window_max_required_neighbors_by_atom
-            ),
+            maximum_required_by_atom=(self._window_max_required_neighbors_by_atom),
             verlet_skin_misses=self._fixed_builder.skin_misses,
         )
 
@@ -1264,8 +1313,15 @@ def _run_rob1_measured_loop(
     profiler: CudaPhaseProfiler,
 ) -> tuple[float, list[Any], list[Any] | None, str | None]:
     """Run only committed DPA4 transaction boundaries through reporters."""
-
     config = request.config
+
+    def recorded_frame(current_state: GPUMDState, step: int) -> Any:
+        from md_benchmark.stress_capture import save_validation_frame
+
+        frame = _state_to_atoms(request.atoms, current_state, step=step)
+        save_validation_frame(frame, request.options)
+        return frame
+
     observations: list[Any] = []
     memory_frames: list[Any] | None = (
         [] if config.collect_trajectory and request.output_path is None else None
@@ -1279,9 +1335,7 @@ def _run_rob1_measured_loop(
             config.observation_steps if config.collect_statistics else ()
         ),
         record_interval=(config.record_interval if config.collect_trajectory else 0),
-        verlet_rebuild_interval=int(
-            request.options.get("verlet_rebuild_interval", 0)
-        ),
+        verlet_rebuild_interval=int(request.options.get("verlet_rebuild_interval", 0)),
     )
 
     torch.cuda.reset_peak_memory_stats(controller.generation.device)
@@ -1295,7 +1349,7 @@ def _run_rob1_measured_loop(
     state = controller.generation.state  # type: ignore[attr-defined]
     if config.collect_trajectory:
         _append_trajectory(
-            _state_to_atoms(request.atoms, state, step=0),
+            recorded_frame(state, 0),
             memory_frames=memory_frames,
             partial_path=partial_path,
         )
@@ -1312,7 +1366,7 @@ def _run_rob1_measured_loop(
             observations.append(_observation(boundary, state, masses))
         if config.collect_trajectory and boundary % config.record_interval == 0:
             _append_trajectory(
-                _state_to_atoms(request.atoms, state, step=boundary),
+                recorded_frame(state, boundary),
                 memory_frames=memory_frames,
                 partial_path=partial_path,
             )
@@ -1344,9 +1398,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     if request.config.ensemble.lower() != "nvt":
         raise ValueError("DPA4 Opt3 supports only NVT")
     if request.config.integrator not in {"berendsen", "nose_hoover_chain"}:
-        raise ValueError(
-            "DPA4 Opt3 supports Berendsen and Nose-Hoover Chain NVT"
-        )
+        raise ValueError("DPA4 Opt3 supports Berendsen and Nose-Hoover Chain NVT")
     if request.atoms.constraints:
         raise NotImplementedError("DPA4 Opt3 does not support ASE constraints")
     if not bool(np.asarray(request.atoms.pbc).all()):
@@ -1373,9 +1425,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             atoms.get_momenta(), dtype=torch.float64, device=device
         ).clone(),
     )
-    masses = torch.as_tensor(
-        atoms.get_masses(), dtype=torch.float64, device=device
-    )
+    masses = torch.as_tensor(atoms.get_masses(), dtype=torch.float64, device=device)
     profiler = CudaPhaseProfiler(
         enabled=performance_profile_requested(request.options),
         device=device,
@@ -1387,10 +1437,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
     )
     configured_search_capacity = request.options.get("graph_neighbors_per_atom")
     legacy_search_capacity = request.options.get("neighbor_search_capacity")
-    if (
-        configured_search_capacity is not None
-        and legacy_search_capacity is not None
-    ):
+    if configured_search_capacity is not None and legacy_search_capacity is not None:
         if int(configured_search_capacity) != int(legacy_search_capacity):
             raise ValueError(
                 "graph_neighbors_per_atom and neighbor_search_capacity disagree"
@@ -1426,9 +1473,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         ),
         graph_edge_capacity_alignment=configured_capacity_alignment,
         graph_edge_capacity=(
-            None
-            if configured_edge_capacity is None
-            else int(configured_edge_capacity)
+            None if configured_edge_capacity is None else int(configured_edge_capacity)
         ),
         neighbor_search_capacity=(
             None
@@ -1514,9 +1559,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
                 profiler=profiler,
                 shared_evaluator=shared_evaluator,
             )
-            generation.production_replays = int(
-                snapshot["step_counter"].detach().cpu()
-            )
+            generation.production_replays = int(snapshot["step_counter"].detach().cpu())
             return generation
 
         controller = Rob1Controller(
@@ -1546,10 +1589,8 @@ def run_md(request: MDRunRequest) -> MDRunResult:
             state.positions.to(dtype=runner.model_dtype)
         )
         controller.begin_production()
-        elapsed, observations, trajectory, trajectory_path = (
-            _run_rob1_measured_loop(
-                request, controller, state, masses, profiler
-            )
+        elapsed, observations, trajectory, trajectory_path = _run_rob1_measured_loop(
+            request, controller, state, masses, profiler
         )
         runner = controller.generation
         state = runner.state
@@ -1602,9 +1643,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "initial_force_evaluations": 1,
         "total_force_evaluations": request.config.steps + 1,
         "graph_requested_edge_capacity": (
-            None
-            if configured_edge_capacity is None
-            else int(configured_edge_capacity)
+            None if configured_edge_capacity is None else int(configured_edge_capacity)
         ),
         "graph_edge_capacity": runner.capacity_plan.edge_capacity,
         "graph_candidate_slots": runner.capacity_plan.candidate_slots,
@@ -1644,8 +1683,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         ),
         "fixed_builder_verlet_rebuilds": runner._fixed_builder.skin_rebuilds,
         "fixed_builder_candidate_universe_size": (
-            runner._fixed_builder.num_atoms
-            * runner._fixed_builder.candidates_per_atom
+            runner._fixed_builder.num_atoms * runner._fixed_builder.candidates_per_atom
         ),
         "fixed_builder_active_candidate_slots": (
             runner._fixed_builder.num_atoms
@@ -1700,9 +1738,7 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         ),
         "trajectory_stress_recompute_count": 0,
         "trajectory_record_interval": (
-            request.config.record_interval
-            if request.config.collect_trajectory
-            else 0
+            request.config.record_interval if request.config.collect_trajectory else 0
         ),
         "trajectory_frame_count": (
             request.config.steps // request.config.record_interval + 1
@@ -1728,6 +1764,19 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         "performance_profile": profiler.summary(synchronize=False),
         **rob1_stats,
     }
+    if runner.capture_stress:
+        from md_benchmark.stress_capture import BACKEND, capture_metadata
+
+        metadata.update(
+            capture_metadata(
+                True, stable=runner._addresses() == runner._state_addresses
+            )
+        )
+        metadata.update(
+            trajectory_stress_backend=BACKEND,
+            trajectory_stress_source="captured-current-committed-state",
+            trajectory_record_model_calls=0,
+        )
     if request.config.integrator == "nose_hoover_chain":
         metadata["nose_hoover_chain"] = {
             "tchain": int(request.options.get("tchain", 3)),
